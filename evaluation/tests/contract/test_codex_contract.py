@@ -848,6 +848,43 @@ def test_all_sut_docker_execs_share_one_docker_budget(tmp_path: Path) -> None:
     assert errors == []
 
 
+def test_plugin_list_retries_a_transient_invalid_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class SequencedDocker:
+        def __init__(self) -> None:
+            self.outputs = iter(
+                (
+                    '{"available": [{"pluginId": "powercontext"}], "installed": []}\n',
+                    (
+                        '{"available": [], "installed": '
+                        '[{"pluginId": "powercontext", "version": "1.0.0", "installed": true}]}\n'
+                    ),
+                )
+            )
+            self.calls = 0
+
+        def run(self, argv: tuple[str, ...], **kwargs: object) -> CommandResult:
+            self.calls += 1
+            return command_result(next(self.outputs))
+
+    docker = SequencedDocker()
+    monkeypatch.setattr(powercontext_sut.time, "sleep", lambda _: None)
+
+    assert DockerSut(docker)._plugin_list("container", make_paths(tmp_path)) == ("powercontext", "1.0.0")
+    assert docker.calls == 2
+
+
+def test_plugin_list_fails_closed_after_transient_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class InvalidDocker:
+        def run(self, argv: tuple[str, ...], **kwargs: object) -> CommandResult:
+            return command_result('{"available": [], "installed": []}\n')
+
+    monotonic = iter((0.0, 61.0))
+    monkeypatch.setattr(powercontext_sut.time, "monotonic", lambda: next(monotonic))
+
+    with pytest.raises(InvalidTreatment, match="exactly one plugin"):
+        DockerSut(InvalidDocker())._plugin_list("container", make_paths(tmp_path))
+
+
 def test_sut_transcript_has_hardening_mount_allowlist_shared_network_and_scope(tmp_path: Path) -> None:
     paths = make_paths(tmp_path)
     docker = TranscriptDocker()

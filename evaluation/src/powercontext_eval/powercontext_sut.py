@@ -2138,32 +2138,37 @@ class DockerSut:
         )
 
     def _plugin_list(self, container: str, paths: ArmPaths) -> tuple[str, str]:
-        result = self._docker.run(
-            ("docker", "exec", container, _CONTAINER_CODEX, "plugin", "list", "--json"),
-            cwd=paths.runtime,
-            timeout=30,
-        )
-        try:
-            value = json.loads(result.stdout)
-            if not isinstance(value, dict) or value.get("available") != []:
-                raise TypeError
-            plugins = value["installed"]
-            if not isinstance(plugins, list) or len(plugins) != 1 or not isinstance(plugins[0], dict):
-                raise TypeError
-            plugin = plugins[0]
-            plugin_id = plugin["pluginId"]
-            version = plugin["version"]
-            if (
-                not isinstance(plugin_id, str)
-                or not plugin_id
-                or not isinstance(version, str)
-                or not version
-                or plugin.get("installed") is not True
-            ):
-                raise TypeError
-        except (json.JSONDecodeError, KeyError, TypeError):
-            raise InvalidTreatment("Isolated Codex home must contain exactly one plugin")
-        return plugin_id, version
+        deadline = time.monotonic() + 60
+        while True:
+            result = self._docker.run(
+                ("docker", "exec", container, _CONTAINER_CODEX, "plugin", "list", "--json"),
+                cwd=paths.runtime,
+                timeout=30,
+            )
+            try:
+                value = json.loads(result.stdout)
+                if not isinstance(value, dict) or value.get("available") != []:
+                    raise TypeError
+                plugins = value["installed"]
+                if not isinstance(plugins, list) or len(plugins) != 1 or not isinstance(plugins[0], dict):
+                    raise TypeError
+                plugin = plugins[0]
+                plugin_id = plugin["pluginId"]
+                version = plugin["version"]
+                if (
+                    not isinstance(plugin_id, str)
+                    or not plugin_id
+                    or not isinstance(version, str)
+                    or not version
+                    or plugin.get("installed") is not True
+                ):
+                    raise TypeError
+            except (json.JSONDecodeError, KeyError, TypeError):
+                if time.monotonic() >= deadline:
+                    raise InvalidTreatment("Isolated Codex home must contain exactly one plugin") from None
+                time.sleep(0.5)
+                continue
+            return plugin_id, version
 
     def _evidence(
         self,
