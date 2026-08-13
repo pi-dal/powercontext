@@ -746,9 +746,11 @@ class DockerSut:
         preserve_for_diagnosis = False
         try:
             # Docker's control socket becomes unreliable when many task threads create
-            # bridges and start relays simultaneously.  Serialize only the short
-            # control-plane section; OFF/ON execution remains fully parallel.
-            with _DOCKER_NETWORK_CONTROL_LOCK:
+            # bridges and start relays simultaneously.  Take the shared Docker budget
+            # before the network lock so long-running attached operations cannot leave
+            # every other pair queued behind a lock holder that is itself waiting for
+            # admission. OFF/ON execution remains fully parallel.
+            with docker_pressure.heavy_operation(), _DOCKER_NETWORK_CONTROL_LOCK:
                 self._create_network(config, network, cwd)
                 network_created = True
                 gateway = self.network_gateway(network, cwd)
@@ -758,7 +760,7 @@ class DockerSut:
             preserve_for_diagnosis = network_created
             raise
         finally:
-            with _DOCKER_NETWORK_CONTROL_LOCK:
+            with docker_pressure.heavy_operation(), _DOCKER_NETWORK_CONTROL_LOCK:
                 try:
                     relay.stop()
                 finally:

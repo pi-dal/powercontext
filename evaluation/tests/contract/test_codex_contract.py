@@ -16,7 +16,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import BinaryIO, cast
+from typing import BinaryIO, Self, cast
 from urllib.parse import quote, quote_plus
 from urllib.request import urlopen
 
@@ -2784,6 +2784,49 @@ def test_parallel_pairs_serialize_docker_network_control_plane(tmp_path: Path) -
     assert not any(thread.is_alive() for thread in threads)
     assert errors == []
     assert maximum == 1
+
+
+def test_network_control_waits_for_docker_budget_before_taking_global_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waiting_for_budget = threading.Event()
+
+    class ObservableSemaphore:
+        def __init__(self) -> None:
+            self._delegate = threading.BoundedSemaphore(1)
+
+        def __enter__(self) -> Self:
+            waiting_for_budget.set()
+            self._delegate.acquire()
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self._delegate.release()
+
+    semaphore = ObservableSemaphore()
+    monkeypatch.setattr(powercontext_sut.docker_pressure, "_DOCKER_HEAVY_OPERATION_SEMAPHORE", semaphore)
+    errors: list[BaseException] = []
+
+    def run_network() -> None:
+        try:
+            with DockerSut(TranscriptDocker(), relay_factory=FakeRelay)._run_network(sut_config(tmp_path), tmp_path):
+                pass
+        except BaseException as error:  # noqa: BLE001 - thread failures must reach the assertion
+            errors.append(error)
+
+    with powercontext_sut.docker_pressure.heavy_operation():
+        waiting_for_budget.clear()
+        thread = threading.Thread(target=run_network)
+        thread.start()
+        assert waiting_for_budget.wait(timeout=2)
+        lock_available = powercontext_sut._DOCKER_NETWORK_CONTROL_LOCK.acquire(blocking=False)
+        if lock_available:
+            powercontext_sut._DOCKER_NETWORK_CONTROL_LOCK.release()
+
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert errors == []
+    assert lock_available
 
 
 def test_parallel_codex_execs_share_a_bounded_attach_budget(tmp_path: Path) -> None:
