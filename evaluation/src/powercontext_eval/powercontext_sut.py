@@ -691,7 +691,7 @@ class DockerSut:
         store: ArtifactStore,
     ) -> SutOutcome:
         source_provenance = self._verify_source(config)
-        self._validate_tokensflow_inputs(config, paths)
+        self._validate_tokensflow_source(config, paths)
         with self._run_network(config, config.source_checkout) as (network, relay_url):
             return self._execute_arm(config, arm, paths, prompt, store, network, relay_url, source_provenance)
 
@@ -720,7 +720,7 @@ class DockerSut:
             before_arm(Arm.OFF)
         source_provenance = self._verify_source(config)
         for arm in (Arm.OFF, Arm.ON):
-            self._validate_tokensflow_inputs(config, paths[arm])
+            self._validate_tokensflow_source(config, paths[arm])
         with self._run_network(config, config.source_checkout) as (network, relay_url):
             outcomes: dict[Arm, SutOutcome] = {}
             for arm in (Arm.OFF, Arm.ON):
@@ -865,6 +865,7 @@ class DockerSut:
         preserve_after_drain_failure = False
         preserve_after_infrastructure_failure = False
         tokensflow_wrapper_staged = False
+        tokensflow_binary_staged = False
         tokensflow_environment = tokensflow_runtime_environment()
         tokensflow_environment_values = tuple(
             dict.fromkeys(value for value in tokensflow_environment.values() if value)
@@ -880,6 +881,8 @@ class DockerSut:
             self._stage_recorder(config, paths)
             self._stage_tokensflow_wrapper(paths)
             tokensflow_wrapper_staged = True
+            self._stage_tokensflow_binary(config, paths)
+            tokensflow_binary_staged = True
             self._initialize_workspace(config, arm, paths)
             self._prewarm(config, arm, paths, network, relay_url)
             self._start_container(
@@ -1055,13 +1058,16 @@ class DockerSut:
                         container_removed = self._remove_container_for_cleanup(container, paths)
                         if not container_removed:
                             self._write_tokensflow_recovery_marker(paths, "tokensflow_container_cleanup_failed")
-                    if tokensflow_wrapper_staged and not preserve_for_diagnosis and container_removed:
-                        self._cleanup_tokensflow_wrapper(paths)
+                    if not preserve_for_diagnosis and container_removed:
+                        if tokensflow_binary_staged:
+                            self._cleanup_tokensflow_binary(paths)
+                        if tokensflow_wrapper_staged:
+                            self._cleanup_tokensflow_wrapper(paths)
                     if container_started and not preserve_for_diagnosis and not container_removed:
                         raise TokensFlowInfrastructureError("TokensFlow container cleanup failed") from None
 
     @staticmethod
-    def _validate_tokensflow_inputs(config: SutConfig, paths: ArmPaths) -> tuple[Path, Path]:
+    def _validate_tokensflow_source(config: SutConfig, paths: ArmPaths) -> None:
         if paths.tokensflow_home is None:
             raise TokensFlowInfrastructureError("TokensFlow inputs must be configured")
         try:
@@ -1073,7 +1079,22 @@ class DockerSut:
             )
         except UnsafeSutConfiguration:
             raise TokensFlowInfrastructureError("TokensFlow binary validation failed") from None
-        return config.tokensflow_binary, paths.tokensflow_home
+
+    @staticmethod
+    def _validate_tokensflow_inputs(paths: ArmPaths) -> tuple[Path, Path]:
+        if paths.tokensflow_home is None:
+            raise TokensFlowInfrastructureError("TokensFlow inputs must be configured")
+        snapshot = paths.runtime.parent / "evaluation-control" / "tokensflow-binary" / "tokensflow"
+        try:
+            _tool_directory_mount(
+                snapshot,
+                "/tools/tokensflow-dir",
+                expected_name="tokensflow",
+                require_executable=True,
+            )
+        except UnsafeSutConfiguration:
+            raise TokensFlowInfrastructureError("TokensFlow binary validation failed") from None
+        return snapshot, paths.tokensflow_home
 
     def _tokensflow_egress_is_attached(self, config: SutConfig, container: str, paths: ArmPaths) -> bool:
         template = (
@@ -1180,7 +1201,7 @@ class DockerSut:
         runtime_environment: Mapping[str, str],
         command_secrets: Sequence[str],
     ) -> TokensFlowEvidence:
-        tokensflow_binary, tokensflow_home = self._validate_tokensflow_inputs(config, paths)
+        tokensflow_binary, tokensflow_home = self._validate_tokensflow_inputs(paths)
         host_environment = {
             **runtime_environment,
             **direct_egress_environment(),
@@ -1245,7 +1266,7 @@ class DockerSut:
         runtime_environment: Mapping[str, str],
         command_secrets: Sequence[str],
     ) -> TokensFlowDaemonHandle:
-        _, tokensflow_home = self._validate_tokensflow_inputs(config, paths)
+        _, tokensflow_home = self._validate_tokensflow_inputs(paths)
         state = "/root/.local/share/tokensflow"
         container_pid_file = f"{state}/evaluation-daemon.pid"
         container_log_file = f"{state}/evaluation-daemon.log"
@@ -1810,6 +1831,141 @@ class DockerSut:
                 os.close(root_fd)
 
     @staticmethod
+    def _stage_tokensflow_binary(config: SutConfig, paths: ArmPaths) -> Path:
+        """Snapshot the mutable host install behind the evaluator-owned wrapper."""
+
+        source = config.tokensflow_binary
+        raw = os.fspath(source)
+        if not source.is_absolute() or source.name != "tokensflow" or "\0" in raw or ".." in source.parts:
+            raise TokensFlowInfrastructureError("TokensFlow binary snapshot failed")
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        root_fd = -1
+        control_fd = -1
+        snapshot_fd = -1
+        destination_fd = -1
+        source_fd = -1
+        snapshot_created = False
+        file_created = False
+        try:
+            source_fd = os.open(source, file_flags)
+            source_metadata = os.fstat(source_fd)
+            if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_mode & 0o111 == 0:
+                raise OSError("TokensFlow source is not an executable regular file")
+            root_fd = os.open(paths.runtime.parent, directory_flags)
+            control_fd = os.open("evaluation-control", directory_flags, dir_fd=root_fd)
+            control_metadata = os.fstat(control_fd)
+            if not stat.S_ISDIR(control_metadata.st_mode) or stat.S_IMODE(control_metadata.st_mode) != 0o555:
+                raise OSError("TokensFlow control directory is unsafe")
+            os.fchmod(control_fd, 0o700)
+            os.mkdir("tokensflow-binary", mode=0o700, dir_fd=control_fd)
+            snapshot_created = True
+            snapshot_fd = os.open("tokensflow-binary", directory_flags, dir_fd=control_fd)
+            destination_fd = os.open(
+                "tokensflow",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                0o555,
+                dir_fd=snapshot_fd,
+            )
+            file_created = True
+            while chunk := os.read(source_fd, 64 * 1024):
+                view = memoryview(chunk)
+                written = 0
+                while written < len(view):
+                    count = os.write(destination_fd, view[written:])
+                    if count <= 0:
+                        raise OSError("TokensFlow binary snapshot made no progress")
+                    written += count
+            os.fchmod(destination_fd, 0o555)
+            os.fsync(destination_fd)
+            os.close(destination_fd)
+            destination_fd = -1
+            os.fchmod(snapshot_fd, 0o555)
+            os.fsync(snapshot_fd)
+            os.fchmod(control_fd, 0o555)
+            os.fsync(control_fd)
+        except OSError:
+            try:
+                if destination_fd >= 0:
+                    os.close(destination_fd)
+                    destination_fd = -1
+                if snapshot_fd >= 0:
+                    os.fchmod(snapshot_fd, 0o700)
+                    if file_created:
+                        os.unlink("tokensflow", dir_fd=snapshot_fd)
+                if control_fd >= 0:
+                    os.fchmod(control_fd, 0o700)
+                    if snapshot_created:
+                        os.rmdir("tokensflow-binary", dir_fd=control_fd)
+                    os.fchmod(control_fd, 0o555)
+            except OSError:
+                pass
+            raise TokensFlowInfrastructureError("TokensFlow binary snapshot failed") from None
+        finally:
+            if destination_fd >= 0:
+                os.close(destination_fd)
+            if snapshot_fd >= 0:
+                os.close(snapshot_fd)
+            if control_fd >= 0:
+                os.close(control_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+            if source_fd >= 0:
+                os.close(source_fd)
+        return paths.runtime.parent / "evaluation-control" / "tokensflow-binary" / "tokensflow"
+
+    @staticmethod
+    def _cleanup_tokensflow_binary(paths: ArmPaths) -> None:
+        """Remove only the exact evaluator-owned TokensFlow snapshot."""
+
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        read_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        root_fd = -1
+        control_fd = -1
+        snapshot_fd = -1
+        binary_fd = -1
+        try:
+            root_fd = os.open(paths.runtime.parent, directory_flags)
+            try:
+                control_fd = os.open("evaluation-control", directory_flags, dir_fd=root_fd)
+                snapshot_fd = os.open("tokensflow-binary", directory_flags, dir_fd=control_fd)
+            except FileNotFoundError:
+                return
+            binary_fd = os.open("tokensflow", read_flags, dir_fd=snapshot_fd)
+            control_metadata = os.fstat(control_fd)
+            snapshot_metadata = os.fstat(snapshot_fd)
+            binary_metadata = os.fstat(binary_fd)
+            if (
+                not stat.S_ISDIR(control_metadata.st_mode)
+                or not stat.S_ISDIR(snapshot_metadata.st_mode)
+                or not stat.S_ISREG(binary_metadata.st_mode)
+                or stat.S_IMODE(control_metadata.st_mode) != 0o555
+                or stat.S_IMODE(snapshot_metadata.st_mode) != 0o555
+                or stat.S_IMODE(binary_metadata.st_mode) != 0o555
+                or set(os.listdir(snapshot_fd)) != {"tokensflow"}
+            ):
+                raise UnsafeSutConfiguration("TokensFlow binary cleanup path is unsafe")
+            os.close(binary_fd)
+            binary_fd = -1
+            os.fchmod(snapshot_fd, 0o700)
+            os.unlink("tokensflow", dir_fd=snapshot_fd)
+            os.fchmod(control_fd, 0o700)
+            os.rmdir("tokensflow-binary", dir_fd=control_fd)
+            os.fchmod(control_fd, 0o555)
+            os.fsync(control_fd)
+        except OSError as error:
+            raise UnsafeSutConfiguration("TokensFlow binary cleanup failed") from error
+        finally:
+            if binary_fd >= 0:
+                os.close(binary_fd)
+            if snapshot_fd >= 0:
+                os.close(snapshot_fd)
+            if control_fd >= 0:
+                os.close(control_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+
+    @staticmethod
     def _cleanup_tokensflow_wrapper(paths: ArmPaths) -> None:
         """Remove the per-arm wrapper after its container is gone."""
 
@@ -2019,7 +2175,7 @@ class DockerSut:
         tokensflow_command_secrets: Sequence[str],
     ) -> None:
         scope = f"eval:{config.run_id}:{arm.value}"
-        tokensflow_binary, _tokensflow_home = self._validate_tokensflow_inputs(config, paths)
+        tokensflow_binary, _tokensflow_home = self._validate_tokensflow_inputs(paths)
         command = (
             "docker",
             "run",

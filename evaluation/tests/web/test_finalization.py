@@ -6,9 +6,11 @@ import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from powercontext_eval.powercontext_sut import DockerSut
 from powercontext_eval.process import CommandResult
 from powercontext_eval.web.finalization import DockerFinalizationRuntime, TokensFlowFinalizer
 from powercontext_eval.web.models import TaskCreate, TaskResult, TaskStatus
@@ -760,6 +762,26 @@ def test_force_cleanup_commands_share_one_total_timeout_budget(tmp_path: Path) -
     assert runtime.cleanup(job, graceful=False) is True
 
     assert runner.timeouts == [30.0, 10.0]
+
+
+def test_finalizer_cleanup_removes_tokensflow_binary_snapshot_with_wrapper(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    job = _register(store, key="binary-snapshot-cleanup")
+    runtime_path = tmp_path / job.runtime_path
+    runtime_path.mkdir(parents=True)
+    paths = SimpleNamespace(runtime=runtime_path)
+    source = tmp_path / "tokensflow"
+    source.write_bytes(b"immutable snapshot")
+    source.chmod(0o755)
+    DockerSut._stage_tokensflow_wrapper(paths)
+    DockerSut._stage_tokensflow_binary(SimpleNamespace(tokensflow_binary=source), paths)
+    (runtime_path / "root-home").mkdir()
+    control = runtime_path.parent / "evaluation-control"
+
+    runtime = DockerFinalizationRuntime(tmp_path, runner=LifecycleRunner())
+    assert runtime.cleanup(job, graceful=False) is True
+
+    assert not control.exists()
 
 
 def test_restart_after_queue_pass_and_container_removal_finishes_idempotent_cleanup(tmp_path: Path) -> None:

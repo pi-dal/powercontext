@@ -1007,14 +1007,13 @@ def test_tokensflow_identity_gate_mounts_dynamic_binary_and_starts_one_arm_daemo
 
     task = next(command for command in docker.commands if command[:3] == ("docker", "run", "-d"))
     mounts = [task[index + 1] for index, value in enumerate(task) if value == "--mount"]
-    assert f"type=bind,src={config.tokensflow_binary.resolve().parent},dst=/tools/tokensflow-dir,readonly" in mounts
+    snapshot = paths.runtime.parent / "evaluation-control" / "tokensflow-binary" / "tokensflow"
+    assert f"type=bind,src={snapshot.parent},dst=/tools/tokensflow-dir,readonly" in mounts
     assert f"type=bind,src={paths.tokensflow_home},dst=/root" in mounts
     assert not any(part.startswith(("HOME=", "CODEX_HOME=")) for part in task)
 
     host_whoami_index = next(
-        index
-        for index, command in enumerate(docker.commands)
-        if command == (os.fspath(config.tokensflow_binary), "whoami")
+        index for index, command in enumerate(docker.commands) if command == (os.fspath(snapshot), "whoami")
     )
     container_whoami_index = next(
         index
@@ -1101,6 +1100,10 @@ def test_artifact_complete_arm_hands_off_without_waiting_for_tokensflow_drain(tm
     assert descriptor.container_name == "powercontext-eval-run-1-off"
     assert descriptor.runtime == paths.runtime
     assert descriptor.wrapper == paths.runtime.parent / "evaluation-control/tokensflow-wrapper"
+    snapshot = paths.runtime.parent / "evaluation-control" / "tokensflow-binary" / "tokensflow"
+    assert snapshot.is_file()
+    assert snapshot.read_bytes() == config.tokensflow_binary.read_bytes()
+    assert stat.S_IMODE(snapshot.stat().st_mode) == 0o555
     assert descriptor.evidence_bytes > 0
     assert len(descriptor.evidence_sha256) == 64
     assert not any(_is_tokensflow(command, "upload") for command in docker.commands)
@@ -1212,6 +1215,29 @@ def test_tokensflow_path_wrapper_clears_only_proxy_environment_and_preserves_arg
     }
     sut._cleanup_tokensflow_wrapper(paths)
     assert not wrapper.parent.parent.exists()
+
+
+def test_tokensflow_binary_snapshot_survives_atomic_source_replacement(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    paths.prepare()
+    config = sut_config(tmp_path)
+    sut = DockerSut(TranscriptDocker())
+    sut._stage_tokensflow_wrapper(paths)
+
+    snapshot = sut._stage_tokensflow_binary(config, paths)
+    replacement = config.tokensflow_binary.with_name("tokensflow.new")
+    replacement.write_bytes(b"replacement")
+    replacement.chmod(0o755)
+    os.replace(replacement, config.tokensflow_binary)
+
+    assert snapshot.read_bytes() == b"binary"
+    assert snapshot.stat().st_ino != config.tokensflow_binary.stat().st_ino
+    assert stat.S_IMODE(snapshot.stat().st_mode) == 0o555
+    assert sut._validate_tokensflow_inputs(paths)[0] == snapshot
+
+    sut._cleanup_tokensflow_binary(paths)
+    sut._cleanup_tokensflow_wrapper(paths)
+    assert not snapshot.parent.parent.exists()
 
 
 def test_container_mounts_tokensflow_wrapper_read_only_without_changing_relay_environment(tmp_path: Path) -> None:
@@ -2218,6 +2244,7 @@ def test_tokensflow_command_failures_are_sanitized_block_codex_and_retain_contai
     config = sut_config(tmp_path)
     config.codex_binary.write_text("binary")
     config.uv_binary.write_text("binary")
+    snapshot = paths.runtime.parent / "evaluation-control" / "tokensflow-binary" / "tokensflow"
 
     class AdversarialDocker(TranscriptDocker):
         tokensflow_secrets: list[tuple[str, ...]]
@@ -2229,9 +2256,9 @@ def test_tokensflow_command_failures_are_sanitized_block_codex_and_retain_contai
         def run(self, argv: tuple[str, ...], **kwargs: object) -> CommandResult:
             detached = argv[:3] == ("docker", "exec", "-d") and _is_tokensflow(argv, "daemon")
             readiness = not detached and any("evaluation-daemon.pid" in part for part in argv)
-            capture = argv == (os.fspath(config.tokensflow_binary), "whoami")
+            capture = argv == (os.fspath(snapshot), "whoami")
             related = (
-                argv[:1] == (os.fspath(config.tokensflow_binary),)
+                argv[:1] == (os.fspath(snapshot),)
                 or (argv[:2] == ("docker", "exec") and any(part.endswith("/tokensflow") for part in argv))
                 or readiness
             )

@@ -143,7 +143,9 @@ class DockerFinalizationRuntime:
                 deadline=deadline,
             ):
                 return False
-            DockerSut._cleanup_tokensflow_wrapper(cast(ArmPaths, SimpleNamespace(runtime=runtime)))
+            paths = cast(ArmPaths, SimpleNamespace(runtime=runtime))
+            DockerSut._cleanup_tokensflow_binary(paths)
+            DockerSut._cleanup_tokensflow_wrapper(paths)
             self._remove_private_home(runtime / "root-home")
         except (CommandError, OSError, UnsafeSutConfiguration):
             return False
