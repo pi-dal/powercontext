@@ -414,7 +414,7 @@ const pairCategorySchema = z.enum([
 ]);
 const resolutionAggregateSchema = z.strictObject({
   resolved: nonnegativeIntegerSchema,
-  total: z.number().int().positive(),
+  total: nonnegativeIntegerSchema,
   rate_percent: z.number().min(0).max(100),
 });
 const tokenMetricAggregateSchema = z.strictObject({

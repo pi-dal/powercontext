@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { ApiError, EvaluationApi } from "./api";
+import { batchReport } from "./test/fixtures";
 
 const validTask = {
   powercontext_ref: "latest",
@@ -48,6 +49,35 @@ function apiWithResponse(response: Response): {
 }
 
 describe("EvaluationApi HTTP", () => {
+  it("accepts a running batch report before any task has reached a terminal state", async () => {
+    const runningReport = {
+      ...batchReport,
+      terminal_tasks: 0,
+      comparable_pairs: 0,
+      off: { resolved: 0, total: 0, rate_percent: 0 },
+      on: { resolved: 0, total: 0, rate_percent: 0 },
+      resolution_rate_delta_points: 0,
+      pair_categories: {
+        off_fail_on_pass: 0,
+        off_pass_on_fail: 0,
+        both_pass: 0,
+        both_fail: 0,
+        execution_failure: 0,
+      },
+      task_statuses: {
+        queued: 711,
+        running: 20,
+        succeeded: 0,
+        failed: 0,
+        interrupted: 0,
+        cancelled: 0,
+      },
+    };
+    const { api } = apiWithResponse(jsonResponse(runningReport));
+
+    await expect(api.getBatchReport("batch-running")).resolves.toEqual(runningReport);
+  });
+
   it("accepts batches paused by an infrastructure failure", async () => {
     const batch = {
       batch_id: "batch-luna",
