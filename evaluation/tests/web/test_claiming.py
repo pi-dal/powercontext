@@ -164,21 +164,61 @@ def test_periodic_usage_refresh_keeps_snapshot_current_without_new_claims(tmp_pa
     assert store.list_batches() == []
 
 
-def test_periodic_usage_refresh_fails_closed_when_probe_is_unavailable(tmp_path: Path) -> None:
+def test_periodic_usage_refresh_tolerates_one_failure_while_cached_snapshot_is_fresh(tmp_path: Path) -> None:
     config = _config(tmp_path)
     store = _store(config)
-    batch_id = _batch(store, key="periodic-usage-unavailable", count=1)
+    batch_id = _batch(store, key="periodic-usage-transient", count=1)
+    observations = iter((NOW, NOW + timedelta(seconds=60)))
     coordinator = ClaimCoordinator(
         config,
         store,
-        usage_probe=CountingProbe([UsageUnavailable("unavailable")]),
-        clock=lambda: NOW,
+        usage_probe=CountingProbe([_usage(9), UsageUnavailable("unavailable")]),
+        clock=lambda: next(observations),
     )
 
+    assert coordinator.refresh_usage() is True
+    assert coordinator.refresh_usage() is False
+    batch = store.get_batch(batch_id)
+    assert batch.status is BatchStatus.QUEUED
+    assert batch.control.pause_reason is None
+
+
+def test_periodic_usage_refresh_fails_closed_after_cached_snapshot_expires(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = _store(config)
+    batch_id = _batch(store, key="periodic-usage-expired", count=1)
+    observations = iter((NOW, NOW + timedelta(seconds=121)))
+    coordinator = ClaimCoordinator(
+        config,
+        store,
+        usage_probe=CountingProbe([_usage(9), UsageUnavailable("unavailable")]),
+        clock=lambda: next(observations),
+    )
+
+    assert coordinator.refresh_usage() is True
     assert coordinator.refresh_usage() is False
     batch = store.get_batch(batch_id)
     assert batch.status is BatchStatus.PAUSED
     assert batch.control.pause_reason is BatchPauseReason.USAGE_UNAVAILABLE
+
+
+def test_claim_uses_cached_snapshot_for_the_configured_grace_window(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = _store(config)
+    _batch(store, key="claim-usage-grace", count=1)
+    probe = CountingProbe([UsageUnavailable("must not be called")])
+    store.apply_usage_snapshot(_usage(9), now=NOW)
+    coordinator = ClaimCoordinator(
+        config,
+        store,
+        usage_probe=probe,
+        clock=lambda: NOW + timedelta(seconds=61),
+    )
+
+    claimed = coordinator.claim("slot-0")
+
+    assert claimed is not None
+    assert probe.calls == []
 
 
 def test_threshold_snapshot_pauses_batch_and_returns_no_claim(tmp_path: Path) -> None:

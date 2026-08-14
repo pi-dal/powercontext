@@ -241,12 +241,12 @@ def test_worker_pauses_before_claim_when_usage_reaches_configured_threshold(tmp_
     assert store.latest_usage_snapshot() == _usage(80)
 
 
-def test_worker_reuses_usage_until_the_probe_interval_expires(tmp_path: Path) -> None:
+def test_worker_reuses_usage_until_the_snapshot_max_age_expires(tmp_path: Path) -> None:
     config = _config(tmp_path, usage_probe_seconds=60)
     store = _store(config)
     store.save_usage_snapshot(_usage(10, observed_at=NOW))
     probe = FakeUsageProbe([_usage(11), _usage(12)])
-    observations = iter((NOW + timedelta(seconds=30), NOW + timedelta(seconds=61)))
+    observations = iter((NOW + timedelta(seconds=119), NOW + timedelta(seconds=121)))
     worker = EvaluationWorker(
         config,
         store,
@@ -258,8 +258,8 @@ def test_worker_reuses_usage_until_the_probe_interval_expires(tmp_path: Path) ->
     assert probe.calls == []
 
     assert worker.run_once() is False
-    assert probe.calls == [NOW + timedelta(seconds=61)]
-    assert store.latest_usage_snapshot() == _usage(11, observed_at=NOW + timedelta(seconds=61))
+    assert probe.calls == [NOW + timedelta(seconds=121)]
+    assert store.latest_usage_snapshot() == _usage(11, observed_at=NOW + timedelta(seconds=121))
 
 
 def test_worker_finishes_current_task_before_honoring_user_pause(

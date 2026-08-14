@@ -113,6 +113,9 @@ class ClaimCoordinator:
             snapshot = self._usage_probe.read(now=now)
             self._store.apply_usage_snapshot(snapshot, now=now)
         except UsageUnavailable:
+            snapshot = self._store.latest_usage_snapshot()
+            if snapshot is not None and self._usage_snapshot_is_fresh(snapshot, now=now):
+                return False
             self._store.pause_runnable_batches(
                 reason=BatchPauseReason.USAGE_UNAVAILABLE,
                 now=now,
@@ -122,13 +125,16 @@ class ClaimCoordinator:
 
     def _usage_before_claim(self, now: datetime) -> UsageSnapshot:
         snapshot = self._store.latest_usage_snapshot()
-        if snapshot is not None and is_fresh(
-            snapshot,
-            now=now,
-            max_age=timedelta(seconds=self._config.usage_probe_seconds),
-        ):
+        if snapshot is not None and self._usage_snapshot_is_fresh(snapshot, now=now):
             return snapshot
         return self._usage_probe.read(now=now)
+
+    def _usage_snapshot_is_fresh(self, snapshot: UsageSnapshot, *, now: datetime) -> bool:
+        return is_fresh(
+            snapshot,
+            now=now,
+            max_age=timedelta(seconds=self._config.usage_snapshot_max_age_seconds),
+        )
 
 
 class PeriodicUsageRefresher:
