@@ -50,8 +50,8 @@ def test_worker_initializes_store_and_runs_with_configured_poll(monkeypatch, tmp
     calls: list[tuple[object, ...]] = []
 
     class FakeStore:
-        def __init__(self, database: Path, *, lease_duration: object) -> None:
-            calls.append(("store", database, lease_duration))
+        def __init__(self, database: Path, *, lease_duration: object, max_attempts: int) -> None:
+            calls.append(("store", database, lease_duration, max_attempts))
 
         def initialize(self) -> None:
             calls.append(("initialize",))
@@ -78,6 +78,7 @@ def test_worker_initializes_store_and_runs_with_configured_poll(monkeypatch, tmp
 
     assert result.exit_code == 0, result.output
     assert calls[0][0] == "store"
+    assert calls[0][3] == 5
     assert calls[1] == ("initialize",)
     assert calls[2][0] == "worker"
     assert isinstance(calls[2][1], WebConfig)

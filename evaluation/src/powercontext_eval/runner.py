@@ -7,9 +7,10 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -142,6 +143,7 @@ class RunConfig:
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     finalization_registrar: TokensFlowFinalizationRegistrar | None = None
     container_env: Mapping[str, str] = MappingProxyType({})
+    cancel_event: threading.Event | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not is_safe_codex_model(self.model):
@@ -172,7 +174,7 @@ def run_swebench_pro_instance(
 ) -> RunResult:
     """Run one instance and release a task image imported solely for this run."""
 
-    process = ProcessRunner()
+    process = ProcessRunner(default_cancel_event=config.cancel_event)
     image_cwd = config.root.absolute().parent
     image_was_present = _inspect_task_image(process, instance.task_image, cwd=image_cwd) is not None
     evaluation_failed = False
@@ -485,6 +487,7 @@ class MinimalRunConfig:
     model: str = DEFAULT_CODEX_MODEL
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     finalization_registrar: TokensFlowFinalizationRegistrar | None = None
+    cancel_event: threading.Event | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not is_safe_codex_model(self.model):
@@ -525,6 +528,7 @@ def run_minimal_swebench_pro(
             model=config.model,
             reasoning_effort=config.reasoning_effort,
             finalization_registrar=config.finalization_registrar,
+            cancel_event=config.cancel_event,
         ),
         instance=instance,
         on_phase=on_phase,

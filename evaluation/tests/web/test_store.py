@@ -12,6 +12,8 @@ from powercontext_eval.web.batches import BatchControlEventType, BatchCreate, Ba
 from powercontext_eval.web.controls import BatchControlIntent, BatchPauseReason
 from powercontext_eval.web.models import (
     FailureCategory,
+    FailureCode,
+    RetryDisposition,
     SafeFailure,
     TaskCreate,
     TaskPhase,
@@ -67,6 +69,17 @@ def usage_snapshot(*, used_percent: int, observed_at: datetime = NOW) -> UsageSn
         plan_type="pro",
         account_tokens=1_234,
     )
+
+
+def complete_attempt_cleanup(store: TaskStore, task_id: str, *, now: datetime) -> bool:
+    candidates = [
+        candidate
+        for candidate in store.list_attempt_cleanup_candidates(limit=32, now=now)
+        if candidate.task_id == task_id
+    ]
+    assert len(candidates) == 1
+    store.mark_attempt_evidence_exported(candidates[0].attempt_id)
+    return store.complete_attempt_cleanup_and_schedule_retry(candidates[0].attempt_id, now=now)
 
 
 @pytest.fixture
@@ -760,14 +773,9 @@ def test_sol_and_luna_batches_keep_children_and_retries_model_isolated(store: Ta
         ),
         now=NOW + timedelta(seconds=2),
     )
-    retried, created = store.retry_failed_task(
-        luna.batch_id,
-        luna_task.task_id,
-        idempotency_key="luna-retry-isolated",
-        now=NOW + timedelta(seconds=3),
-    )
+    assert complete_attempt_cleanup(store, luna_task.task_id, now=NOW + timedelta(seconds=3)) is True
+    retried = store.get_batch_task(luna.batch_id, luna_task.task_id)
 
-    assert created is True
     assert store.get_batch_task(sol.batch_id, sol_task.task_id).request.model == "gpt-5.6-sol"
     assert retried.attempt_number == 2
     assert store.get_batch_task(luna.batch_id, luna_task.task_id).request.model == "gpt-5.6-luna"
@@ -903,13 +911,13 @@ def test_pause_and_cancel_wait_for_the_running_benchmark_task_boundary(store: Ta
         TaskStatus.CANCELLED,
     ]
     assert [event.event_type for event in store.list_control_events(cancelled_batch.batch_id)][-3:] == [
+        BatchControlEventType.BATCH_CREATED,
         BatchControlEventType.CANCEL_REQUESTED,
-        BatchControlEventType.INFRASTRUCTURE_FAILURE,
         BatchControlEventType.CANCELLED,
     ]
 
 
-def test_infrastructure_failure_atomically_pauses_batch_without_stopping_other_running_pair(
+def test_infrastructure_failure_keeps_batch_running_and_does_not_stop_other_pair(
     store: TaskStore,
 ) -> None:
     batch = store.create_batch(
@@ -937,24 +945,22 @@ def test_infrastructure_failure_atomically_pauses_batch_without_stopping_other_r
         now=NOW + timedelta(seconds=2),
     )
 
-    pausing = store.get_batch(batch.batch_id)
-    assert pausing.status is BatchStatus.PAUSING
-    assert pausing.control.intent is BatchControlIntent.PAUSE
-    assert pausing.control.pause_reason is BatchPauseReason.INFRASTRUCTURE_FAILURE
+    current = store.get_batch(batch.batch_id)
+    assert current.status is BatchStatus.RUNNING
+    assert current.control.intent is BatchControlIntent.RUN
+    assert current.control.pause_reason is None
     assert [task.status for task in store.list_batch_tasks(batch.batch_id)] == [
         TaskStatus.FAILED,
         TaskStatus.RUNNING,
         TaskStatus.QUEUED,
     ]
-    assert store.claim_next("worker-c", max_concurrency=2, now=NOW + timedelta(seconds=3)) is None
-    event = store.list_control_events(batch.batch_id)[-1]
-    assert event.event_type is BatchControlEventType.INFRASTRUCTURE_FAILURE
-    assert event.actor == "system"
-    assert event.details == {
-        "attempt_id": first.attempt_id,
-        "failure_category": FailureCategory.CODEX_EXECUTION.value,
-        "task_id": first.task_id,
-    }
+    third = store.claim_next("worker-c", max_concurrency=2, now=NOW + timedelta(seconds=3))
+    assert third is not None
+    assert third.task_id not in {first.task_id, second.task_id}
+    assert all(
+        event.event_type is not BatchControlEventType.INFRASTRUCTURE_FAILURE
+        for event in store.list_control_events(batch.batch_id)
+    )
 
     store.succeed(
         second.task_id,
@@ -967,11 +973,12 @@ def test_infrastructure_failure_atomically_pauses_batch_without_stopping_other_r
         ),
         now=NOW + timedelta(seconds=4),
     )
-    paused = store.finalize_batch_intent_after_attempt(batch.batch_id, now=NOW + timedelta(seconds=4))
-    assert paused.status is BatchStatus.PAUSED
+    assert store.finalize_batch_intent_after_attempt(batch.batch_id, now=NOW + timedelta(seconds=4)).status is (
+        BatchStatus.RUNNING
+    )
 
 
-def test_expired_batch_lease_pauses_batch_and_preserves_other_running_pair(store: TaskStore) -> None:
+def test_expired_batch_lease_is_fenced_without_pausing_other_running_pair(store: TaskStore) -> None:
     batch = store.create_batch(
         batch_request("expired-infrastructure-failure-pause"),
         (
@@ -990,23 +997,17 @@ def test_expired_batch_lease_pauses_batch_and_preserves_other_running_pair(store
     recovered = store.recover_expired(now=NOW + timedelta(seconds=61))
 
     assert recovered == [first.task_id]
-    pausing = store.get_batch(batch.batch_id)
-    assert pausing.status is BatchStatus.PAUSING
-    assert pausing.control.intent is BatchControlIntent.PAUSE
-    assert pausing.control.pause_reason is BatchPauseReason.INFRASTRUCTURE_FAILURE
+    current = store.get_batch(batch.batch_id)
+    assert current.status is BatchStatus.RUNNING
+    assert current.control.intent is BatchControlIntent.RUN
+    assert current.control.pause_reason is None
     assert [task.status for task in store.list_batch_tasks(batch.batch_id)] == [
         TaskStatus.INTERRUPTED,
         TaskStatus.RUNNING,
         TaskStatus.QUEUED,
     ]
-    assert store.claim_next("worker-c", max_concurrency=2, now=NOW + timedelta(seconds=61)) is None
-    event = store.list_control_events(batch.batch_id)[-1]
-    assert event.event_type is BatchControlEventType.INFRASTRUCTURE_FAILURE
-    assert event.details == {
-        "attempt_id": first.attempt_id,
-        "failure_category": FailureCategory.WORKER_INTERRUPTION.value,
-        "task_id": first.task_id,
-    }
+    third = store.claim_next("worker-c", max_concurrency=2, now=NOW + timedelta(seconds=61))
+    assert third is not None and third.task_id not in {first.task_id, second.task_id}
 
 
 def test_standalone_infrastructure_failure_does_not_pause_unrelated_batch(store: TaskStore) -> None:
@@ -1035,7 +1036,7 @@ def test_standalone_infrastructure_failure_does_not_pause_unrelated_batch(store:
     assert current.control.pause_reason is None
 
 
-def test_each_parallel_failure_records_event_without_overwriting_user_pause(store: TaskStore) -> None:
+def test_parallel_failures_preserve_user_pause_without_system_pause_events(store: TaskStore) -> None:
     batch = store.create_batch(
         batch_request("parallel-failures-under-user-pause"),
         ("instance_owner__repo-a", "instance_owner__repo-b"),
@@ -1060,7 +1061,7 @@ def test_each_parallel_failure_records_event_without_overwriting_user_pause(stor
         )
 
     current = store.get_batch(batch.batch_id)
-    assert current.status is BatchStatus.COMPLETED
+    assert current.status is BatchStatus.PAUSED
     assert current.control.intent is BatchControlIntent.PAUSE
     assert current.control.pause_reason is BatchPauseReason.USER
     failure_events = [
@@ -1068,10 +1069,10 @@ def test_each_parallel_failure_records_event_without_overwriting_user_pause(stor
         for event in store.list_control_events(batch.batch_id)
         if event.event_type is BatchControlEventType.INFRASTRUCTURE_FAILURE
     ]
-    assert [event.details["task_id"] for event in failure_events] == [first.task_id, second.task_id]
+    assert failure_events == []
 
 
-def test_each_simultaneously_expired_batch_lease_records_its_own_event(store: TaskStore) -> None:
+def test_each_simultaneously_expired_batch_lease_becomes_cleanup_pending_without_pause(store: TaskStore) -> None:
     batch = store.create_batch(
         batch_request("parallel-expired-events"),
         ("instance_owner__repo-a", "instance_owner__repo-b", "instance_owner__repo-c"),
@@ -1084,13 +1085,10 @@ def test_each_simultaneously_expired_batch_lease_records_its_own_event(store: Ta
 
     assert store.recover_expired(now=NOW + timedelta(seconds=61)) == [first.task_id, second.task_id]
 
-    failure_events = [
-        event
-        for event in store.list_control_events(batch.batch_id)
-        if event.event_type is BatchControlEventType.INFRASTRUCTURE_FAILURE
-    ]
-    assert [event.details["attempt_id"] for event in failure_events] == [first.attempt_id, second.attempt_id]
-    assert store.get_batch(batch.batch_id).control.pause_reason is BatchPauseReason.INFRASTRUCTURE_FAILURE
+    candidates = store.list_attempt_cleanup_candidates(limit=10, now=NOW + timedelta(seconds=61))
+    assert [candidate.attempt_id for candidate in candidates] == [first.attempt_id, second.attempt_id]
+    assert store.get_batch(batch.batch_id).control.intent is BatchControlIntent.RUN
+    assert store.get_batch(batch.batch_id).control.pause_reason is None
 
 
 def test_cancel_without_a_running_task_marks_queued_tasks_once(store: TaskStore) -> None:
@@ -1116,7 +1114,7 @@ def test_cancel_without_a_running_task_marks_queued_tasks_once(store: TaskStore)
     ]
 
 
-def test_resume_requires_usage_below_threshold_and_never_happens_implicitly(store: TaskStore) -> None:
+def test_resume_is_pure_user_intent_even_when_latest_usage_is_at_threshold(store: TaskStore) -> None:
     batch = store.create_batch(
         batch_request("resume-control"),
         ("instance_owner__repo-a",),
@@ -1126,17 +1124,7 @@ def test_resume_requires_usage_below_threshold_and_never_happens_implicitly(stor
     at_threshold = usage_snapshot(used_percent=80, observed_at=NOW + timedelta(seconds=2))
     store.save_usage_snapshot(at_threshold)
 
-    with pytest.raises(TaskConflict, match="threshold"):
-        store.request_resume(batch.batch_id, snapshot=at_threshold, now=NOW + timedelta(seconds=2))
-
-    assert store.get_batch(batch.batch_id) == paused
-    below_threshold = usage_snapshot(used_percent=79, observed_at=NOW + timedelta(seconds=3))
-    store.save_usage_snapshot(below_threshold)
-    resumed = store.request_resume(
-        batch.batch_id,
-        snapshot=below_threshold,
-        now=NOW + timedelta(seconds=3),
-    )
+    resumed = store.request_resume(batch.batch_id, now=NOW + timedelta(seconds=2))
 
     assert resumed.status is BatchStatus.QUEUED
     assert resumed.control.intent is BatchControlIntent.RUN
@@ -1156,7 +1144,7 @@ def test_threshold_updates_use_optimistic_concurrency_and_do_not_auto_resume(sto
     )[0]
     paused = store.request_pause(
         batch.batch_id,
-        reason=BatchPauseReason.USAGE_THRESHOLD,
+        reason=BatchPauseReason.USER,
         now=NOW + timedelta(seconds=1),
     )
 
@@ -1214,7 +1202,7 @@ def test_existing_tasks_are_backfilled_as_attempt_one(store: TaskStore) -> None:
     assert task.retryable is False
 
 
-def test_retry_preserves_failed_attempt_and_idempotently_creates_attempt_two(store: TaskStore) -> None:
+def test_cleanup_preserves_failed_attempt_and_idempotently_creates_attempt_two(store: TaskStore) -> None:
     batch = store.create_batch(
         batch_request("attempt-retry"),
         ("instance_owner__repo-a",),
@@ -1235,38 +1223,35 @@ def test_retry_preserves_failed_attempt_and_idempotently_creates_attempt_two(sto
     )
     store.finalize_batch_intent_after_attempt(batch.batch_id, now=NOW + timedelta(seconds=2))
 
-    retry, created = store.retry_failed_task(
-        batch.batch_id,
-        task.task_id,
-        idempotency_key="retry-0001",
-        now=NOW + timedelta(seconds=3),
+    assert complete_attempt_cleanup(store, task.task_id, now=NOW + timedelta(seconds=3)) is True
+    assert failed.attempt_id is not None
+    assert (
+        store.complete_attempt_cleanup_and_schedule_retry(
+            failed.attempt_id,
+            now=NOW + timedelta(seconds=4),
+        )
+        is False
     )
-    replay, replay_created = store.retry_failed_task(
-        batch.batch_id,
-        task.task_id,
-        idempotency_key="retry-0001",
-        now=NOW + timedelta(seconds=4),
-    )
+    retry = store.get_batch_task(batch.batch_id, task.task_id)
 
     assert failed.retryable is True
-    assert created is True
-    assert replay_created is False
-    assert replay == retry
     assert retry.attempt_number == 2
     assert retry.status is TaskStatus.QUEUED
+    assert retry.eligible_at == NOW + timedelta(seconds=33)
     attempts = store.list_task_attempts(batch.batch_id, task.task_id)
     assert [attempt.attempt_number for attempt in attempts] == [1, 2]
     assert attempts[0].status is TaskStatus.FAILED
     assert attempts[0].failure_summary == "Codex process failed"
-    assert attempts[1] == retry
+    assert attempts[1].attempt_id == retry.attempt_id
+    assert attempts[1].eligible_at == retry.eligible_at
     current = store.get_batch_task(batch.batch_id, task.task_id)
     assert current.status is TaskStatus.QUEUED
     assert current.attempt_id == retry.attempt_id
     assert current.attempt_count == 2
     current_batch = store.get_batch(batch.batch_id)
-    assert current_batch.status is BatchStatus.PAUSED
-    assert current_batch.control.intent is BatchControlIntent.PAUSE
-    assert current_batch.control.pause_reason is BatchPauseReason.INFRASTRUCTURE_FAILURE
+    assert current_batch.status is BatchStatus.QUEUED
+    assert current_batch.control.intent is BatchControlIntent.RUN
+    assert current_batch.control.pause_reason is None
     assert [event.event_type for event in store.list_control_events(batch.batch_id)][-1] is (
         BatchControlEventType.TASK_RETRY_REQUESTED
     )
@@ -1298,14 +1283,9 @@ def test_retry_in_a_paused_batch_preserves_pause_control(store: TaskStore) -> No
     )
     store.finalize_batch_intent_after_attempt(batch.batch_id, now=NOW + timedelta(seconds=3))
 
-    retry, created = store.retry_failed_task(
-        batch.batch_id,
-        task.task_id,
-        idempotency_key="retry-paused-0001",
-        now=NOW + timedelta(seconds=4),
-    )
+    assert complete_attempt_cleanup(store, task.task_id, now=NOW + timedelta(seconds=4)) is True
+    retry = store.get_batch_task(batch.batch_id, task.task_id)
 
-    assert created is True
     assert retry.status is TaskStatus.QUEUED
     current_batch = store.get_batch(batch.batch_id)
     assert current_batch.status is BatchStatus.PAUSED
@@ -1363,7 +1343,7 @@ def test_valid_official_outcomes_are_never_retryable(
     assert len(store.list_task_attempts(batch.batch_id, task.task_id)) == 1
 
 
-def test_retry_rejects_a_non_retryable_request_failure(store: TaskStore) -> None:
+def test_operator_retry_of_terminal_failure_waits_for_cleanup(store: TaskStore) -> None:
     batch = store.create_batch(
         batch_request("nonretryable-failure"),
         ("instance_owner__repo-a",),
@@ -1377,20 +1357,35 @@ def test_retry_rejects_a_non_retryable_request_failure(store: TaskStore) -> None
         "worker-a",
         SafeFailure(
             category=FailureCategory.INVALID_REQUEST,
+            failure_code=FailureCode.UNSAFE_SUT_CONFIGURATION,
             phase=TaskPhase.PREPARING,
             summary="Invalid request",
+            retry_disposition=RetryDisposition.TERMINAL,
         ),
         now=NOW + timedelta(seconds=2),
     )
 
     assert failed.retryable is False
-    with pytest.raises(TaskConflict, match="not retryable"):
+    with pytest.raises(TaskConflict, match="cleanup is not complete"):
         store.retry_failed_task(
             batch.batch_id,
             task.task_id,
             idempotency_key="retry-invalid-request",
             now=NOW + timedelta(seconds=3),
         )
+    candidate = store.list_attempt_cleanup_candidates(limit=1, now=NOW + timedelta(seconds=3))[0]
+    store.mark_attempt_evidence_exported(candidate.attempt_id)
+    assert (
+        store.complete_attempt_cleanup_and_schedule_retry(candidate.attempt_id, now=NOW + timedelta(seconds=3)) is False
+    )
+    retry, created = store.retry_failed_task(
+        batch.batch_id,
+        task.task_id,
+        idempotency_key="retry-invalid-request",
+        now=NOW + timedelta(seconds=4),
+    )
+    assert created is True
+    assert retry.attempt_number == 2
 
 
 def test_create_batch_replays_idempotency_key_without_duplicate_children(store: TaskStore) -> None:
@@ -1665,6 +1660,59 @@ def test_worker_capacity_is_published_without_web_configuration_reload(store: Ta
     assert store.health_snapshot(now=NOW + timedelta(seconds=2))["task_parallelism"] == 4
 
 
+def test_runtime_revision_gate_reopens_only_for_matching_web_and_worker(store: TaskStore) -> None:
+    assert store.deployment_admission_open() is False
+    assert store.deployment_snapshot()["deployment_consistent"] is False
+
+    store.record_runtime_revision("web", build_revision="a" * 40, schema_version=2, now=NOW)
+    assert store.deployment_admission_open() is False
+
+    store.record_runtime_revision("worker", build_revision="b" * 40, schema_version=2, now=NOW)
+    assert store.deployment_admission_open() is False
+
+    store.record_runtime_revision("worker", build_revision="a" * 40, schema_version=2, now=NOW)
+    snapshot = store.deployment_snapshot()
+    assert snapshot == {
+        "web_revision": "a" * 40,
+        "worker_revision": "a" * 40,
+        "web_schema_version": 2,
+        "worker_schema_version": 2,
+        "deployment_consistent": True,
+    }
+    assert store.deployment_admission_open() is True
+
+
+def test_initialize_migrates_only_legacy_system_pauses(database: Path) -> None:
+    store = TaskStore(database, lease_duration=timedelta(seconds=60))
+    store.initialize()
+    system_batch = store.create_batch(
+        batch_request("legacy-system-pause"),
+        ("instance_owner__repo-system",),
+        now=NOW,
+    )[0]
+    user_batch = store.create_batch(
+        batch_request("legacy-user-pause"),
+        ("instance_owner__repo-user",),
+        now=NOW,
+    )[0]
+    store.request_pause(user_batch.batch_id, reason=BatchPauseReason.USER, now=NOW + timedelta(seconds=1))
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE batches SET control_intent = ?, pause_reason = ? WHERE batch_id = ?",
+            (BatchControlIntent.PAUSE.value, BatchPauseReason.INFRASTRUCTURE_FAILURE.value, system_batch.batch_id),
+        )
+
+    store.initialize()
+
+    migrated = store.get_batch(system_batch.batch_id)
+    preserved = store.get_batch(user_batch.batch_id)
+    assert migrated.control.intent is BatchControlIntent.RUN
+    assert migrated.control.pause_reason is None
+    assert preserved.control.intent is BatchControlIntent.PAUSE
+    assert preserved.control.pause_reason is BatchPauseReason.USER
+    assert store.list_control_events(system_batch.batch_id)[-1].details == {"reason": "legacy_system_pause_migrated"}
+
+
 @pytest.mark.parametrize("value", [0, 21, True])
 def test_worker_capacity_rejects_out_of_range_values(store: TaskStore, value: object) -> None:
     with pytest.raises(ValueError):
@@ -1773,18 +1821,18 @@ def test_concurrent_claim_race_never_exceeds_capacity_or_duplicates_task(databas
     assert creator.health_snapshot(now=NOW + timedelta(seconds=1))["active_task_pairs"] == 4
 
 
-def test_claim_clamps_stale_worker_time_to_task_creation_and_lease_chronology(store: TaskStore) -> None:
+def test_claim_waits_until_persisted_task_eligibility(store: TaskStore) -> None:
     created_at = NOW + timedelta(seconds=10)
     stale_worker_now = NOW
     queued, _ = store.create(request("stale-claim-clock"), now=created_at)
 
-    claimed = store.claim_next("worker-a", now=stale_worker_now)
-
+    assert store.claim_next("worker-a", now=stale_worker_now) is None
+    claimed = store.claim_next("worker-a", now=created_at)
     assert claimed is not None
     assert claimed.task_id == queued.task_id
     assert claimed.started_at == created_at
-    phased = store.set_phase(queued.task_id, "worker-a", TaskPhase.PREPARING, now=stale_worker_now)
-    heartbeat = store.heartbeat(queued.task_id, "worker-a", now=stale_worker_now)
+    phased = store.set_phase(queued.task_id, "worker-a", TaskPhase.PREPARING, now=created_at)
+    heartbeat = store.heartbeat(queued.task_id, "worker-a", now=created_at)
     assert phased.started_at == heartbeat.started_at == created_at
     assert store.health_snapshot(now=created_at + timedelta(seconds=59))["worker_lease_active"] is True
     assert store.health_snapshot(now=created_at + timedelta(seconds=61))["worker_lease_active"] is False

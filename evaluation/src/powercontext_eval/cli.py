@@ -99,7 +99,11 @@ def worker(root_path: Annotated[Path | None, typer.Option("--root")] = None) -> 
     from powercontext_eval.web.worker import EvaluationWorker
 
     config = _web_config(root_path)
-    store = TaskStore(config.database_path, lease_duration=timedelta(seconds=config.lease_seconds))
+    store = TaskStore(
+        config.database_path,
+        lease_duration=timedelta(seconds=config.lease_seconds),
+        max_attempts=config.max_attempts,
+    )
     store.initialize()
     service = EvaluationWorker(
         config,

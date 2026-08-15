@@ -14,7 +14,8 @@ from powercontext_eval.codex import DEFAULT_CODEX_MODEL, is_safe_codex_model
 _SAFE_DOCKER_NETWORK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 MAX_TASK_PARALLELISM = 20
 MAX_TOKENSFLOW_FINALIZER_TIMEOUT_SECONDS = 600
-MAX_CODEX_CAPACITY_RETRY_MAX = 20
+MAX_ATTEMPTS_LIMIT = 20
+DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_FILESYSTEM_MIN_FREE_BYTES = 10 * 1024**3
 DEFAULT_FILESYSTEM_MIN_FREE_INODES = 1_000_000
 FILESYSTEM_MIN_FREE_BYTES_PER_TASK = 4 * 1024**3
@@ -36,7 +37,7 @@ class _EnvironmentNumbers(BaseModel):
         600
     )
     tokensflow_finalizer_poll_seconds: Annotated[float, Field(gt=0, le=60)] = 5.0
-    codex_capacity_retry_max: Annotated[int, Field(ge=0, le=MAX_CODEX_CAPACITY_RETRY_MAX)] = 5
+    max_attempts: Annotated[int, Field(ge=1, le=MAX_ATTEMPTS_LIMIT)] = DEFAULT_MAX_ATTEMPTS
     filesystem_min_free_bytes: Annotated[int, Field(ge=1)] = DEFAULT_FILESYSTEM_MIN_FREE_BYTES
     filesystem_min_free_inodes: Annotated[int, Field(ge=1)] = DEFAULT_FILESYSTEM_MIN_FREE_INODES
     workspace_reclaim_interval_seconds: Annotated[float, Field(gt=0, le=3600)] = 10.0
@@ -83,7 +84,7 @@ class WebConfig(BaseModel):
         600
     )
     tokensflow_finalizer_poll_seconds: Annotated[float, Field(gt=0, le=60)] = 5.0
-    codex_capacity_retry_max: Annotated[int, Field(ge=0, le=MAX_CODEX_CAPACITY_RETRY_MAX)] = 5
+    max_attempts: Annotated[int, Field(ge=1, le=MAX_ATTEMPTS_LIMIT)] = DEFAULT_MAX_ATTEMPTS
     filesystem_min_free_bytes: Annotated[int, Field(ge=1)] = DEFAULT_FILESYSTEM_MIN_FREE_BYTES
     filesystem_min_free_inodes: Annotated[int, Field(ge=1)] = DEFAULT_FILESYSTEM_MIN_FREE_INODES
     workspace_reclaim_interval_seconds: Annotated[float, Field(gt=0, le=3600)] = 10.0
@@ -166,7 +167,7 @@ class WebConfig(BaseModel):
         task_parallelism: int = 1,
         tokensflow_finalizer_timeout_seconds: int = 600,
         tokensflow_finalizer_poll_seconds: float = 5.0,
-        codex_capacity_retry_max: int = 5,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         filesystem_min_free_bytes: int = DEFAULT_FILESYSTEM_MIN_FREE_BYTES,
         filesystem_min_free_inodes: int = DEFAULT_FILESYSTEM_MIN_FREE_INODES,
         workspace_reclaim_interval_seconds: float = 10.0,
@@ -202,7 +203,7 @@ class WebConfig(BaseModel):
             task_parallelism=task_parallelism,
             tokensflow_finalizer_timeout_seconds=tokensflow_finalizer_timeout_seconds,
             tokensflow_finalizer_poll_seconds=tokensflow_finalizer_poll_seconds,
-            codex_capacity_retry_max=codex_capacity_retry_max,
+            max_attempts=max_attempts,
             filesystem_min_free_bytes=filesystem_min_free_bytes,
             filesystem_min_free_inodes=filesystem_min_free_inodes,
             workspace_reclaim_interval_seconds=workspace_reclaim_interval_seconds,
@@ -232,7 +233,7 @@ class WebConfig(BaseModel):
                     f"{prefix}TOKENSFLOW_FINALIZER_TIMEOUT_SECONDS", "600"
                 ),
                 "tokensflow_finalizer_poll_seconds": environ.get(f"{prefix}TOKENSFLOW_FINALIZER_POLL_SECONDS", "5"),
-                "codex_capacity_retry_max": environ.get(f"{prefix}CODEX_CAPACITY_RETRY_MAX", "5"),
+                "max_attempts": environ.get(f"{prefix}MAX_ATTEMPTS", str(DEFAULT_MAX_ATTEMPTS)),
                 "filesystem_min_free_bytes": environ.get(
                     f"{prefix}FILESYSTEM_MIN_FREE_BYTES", str(DEFAULT_FILESYSTEM_MIN_FREE_BYTES)
                 ),
@@ -271,7 +272,7 @@ class WebConfig(BaseModel):
             task_parallelism=numbers.task_parallelism,
             tokensflow_finalizer_timeout_seconds=numbers.tokensflow_finalizer_timeout_seconds,
             tokensflow_finalizer_poll_seconds=numbers.tokensflow_finalizer_poll_seconds,
-            codex_capacity_retry_max=numbers.codex_capacity_retry_max,
+            max_attempts=numbers.max_attempts,
             filesystem_min_free_bytes=numbers.filesystem_min_free_bytes,
             filesystem_min_free_inodes=numbers.filesystem_min_free_inodes,
             workspace_reclaim_interval_seconds=numbers.workspace_reclaim_interval_seconds,

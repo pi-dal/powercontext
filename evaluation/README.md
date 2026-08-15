@@ -52,14 +52,19 @@ Each concurrent task has its own workspace, runtime, Codex home, PowerContext ho
 are per immutable attempt, while one supervisor owns the configured slots. Codex subscription usage and rate limits
 remain account-wide rather than per slot.
 
-Pause, cancel, an account-usage threshold, usage unavailability, and an infrastructure failure stop new claims.
-Active task pairs finish their current OFF/ON boundary; they are not killed midway. An infrastructure failure
-atomically pauses a runnable batch and records a sanitized control event, while already-active peers finish. Resume
-is always explicit after the failure is resolved, usage is freshly observed below the threshold, and service health
-is verified.
+Only an operator pause or cancel changes durable batch control intent. Account-usage limits, filesystem reserves,
+Docker availability, and a Web/Worker revision mismatch are transient claim-admission gates: they stop only new
+claims and reopen automatically when direct probes recover. One task failure never pauses healthy peers or the
+remaining queue.
 
-`/api/health` reports `active_task_pairs`, `task_parallelism`, `resource_admission_open`, and allowlisted filesystem
-byte/inode capacity in addition to queue counts. Validate a capacity increase at a clean task boundary:
+Retryable task failures use at most five total attempts with persisted 30, 120, 300, and 600 second backoffs. A
+retry is not queued until a sanitized incident manifest and private TokensFlow spool have been exported and the
+exact attempt-owned containers, network, and scratch workspace have been reclaimed. Deterministic request or data
+contract failures remain terminal unless an operator explicitly retries them after fixing the cause.
+
+`/api/health` reports `active_task_pairs`, `task_parallelism`, `resource_admission_open`, allowlisted filesystem
+byte/inode capacity, and the sanitized Web/Worker revision and schema-consistency state in addition to queue counts.
+Validate a capacity increase at a clean task boundary:
 
 1. keep the batch paused with zero running tasks, set `POWERCONTEXT_EVAL_TASK_PARALLELISM` to the intended capacity,
    and restart only the
@@ -72,9 +77,9 @@ byte/inode capacity in addition to queue counts. Validate a capacity increase at
    evaluation, cleanup, retained evidence, service health, and a fresh below-threshold usage observation;
 6. only after every check passes, explicitly resume sustained processing at the selected capacity.
 
-If the wave has an infrastructure failure, keep the batch paused, preserve every failed attempt and its evidence,
-set parallelism back to `1`, restart only the Worker, diagnose and fix the failure, and retry only the infrastructure
-failure items. Do not resume other queued work until those retries succeed and all safety checks pass.
+If the wave encounters a retryable failure, verify that the unaffected queue continues, the failed attempt is
+retained in `/runs` and `private-incidents`, cleanup finishes before the next attempt appears, and the retry budget
+and backoff are honored. A deterministic terminal failure is reported without repeatedly consuming the budget.
 
 ## Subscription usage and batch controls
 
@@ -92,6 +97,7 @@ The deployment defaults are:
 | `POWERCONTEXT_EVAL_FILESYSTEM_MIN_FREE_BYTES` | `10737418240` | Base byte reserve; claim admission also reserves 4 GiB per configured task slot |
 | `POWERCONTEXT_EVAL_FILESYSTEM_MIN_FREE_INODES` | `1000000` | Base inode reserve; claim admission also reserves 250,000 inodes per configured task slot |
 | `POWERCONTEXT_EVAL_WORKSPACE_RECLAIM_INTERVAL_SECONDS` | `10` | Successful scratch reclaim poll interval; retained `/runs` and non-success workspaces are never removed |
+| `POWERCONTEXT_EVAL_MAX_ATTEMPTS` | `5` | Maximum total attempts for one task, including the initial attempt |
 | `POWERCONTEXT_EVAL_TASK_PARALLELISM` | `1` | Concurrent independent OFF/ON task pairs; allowed range is 1 through 20 |
 | `POWERCONTEXT_EVAL_TOKENSFLOW_FINALIZER_TIMEOUT_SECONDS` | `600` | Deadline after durable arm handoff before forced cleanup |
 | `POWERCONTEXT_EVAL_TOKENSFLOW_FINALIZER_POLL_SECONDS` | `5` | Interruptible durable finalizer poll interval |
@@ -100,18 +106,18 @@ The deployment defaults are:
 Changing the model allowlist affects only new submissions. Existing batches keep their immutable model and remain
 readable, runnable, and retryable even when that model is no longer admitted for new work.
 Before each claim, the Worker reserves both bytes and inodes for the configured parallelism. If either reserve is
-unavailable or below its hard boundary, runnable batches pause with `resource_pressure`; recovery never resumes them
-implicitly. A separate Worker maintenance loop removes only a succeeded attempt's reproducible `/work/<run-id>`
-scratch after validating its durable report and terminal deferred cleanup. It never removes `/runs`, failed,
-interrupted, queued, running, or cleanup-pending evidence. Scanning is cyclic, so completed tasks from older batches
-cannot starve newer successful workspaces from reclamation.
+unavailable or below its hard boundary, claim admission closes without changing the batch and reopens after the
+configured reserve plus hysteresis is restored. A separate maintenance loop removes succeeded scratch after
+validating its durable report. Failed and interrupted attempts first export public and private incident evidence,
+then reclaim their exact disposable resources before a retry is eligible. `/runs`, queued/running workspaces, and
+open TokensFlow finalizations are never reclaimed by these loops. Scanning is cyclic, so older history cannot starve
+newer reclaimable workspaces.
 TokensFlow finalization capacity is always twice `POWERCONTEXT_EVAL_TASK_PARALLELISM`; it is not independently
 configurable. When the durable queue exceeds that bound, the oldest excess jobs are force-cleaned in the same poll.
 
 Pause and cancel use a complete SWE-bench task as the boundary: the active OFF/ON pair finishes, then pause starts no
-new child, while cancel marks every remaining unstarted child cancelled. They do not kill an arm midway. Resume is
-always a manual resume and requires a fresh observation below the current threshold. Raising the threshold, reaching
-the reset time, or recovering from usage unavailable never resumes a batch implicitly.
+new child, while cancel marks every remaining unstarted child cancelled. They do not kill an arm midway. Resume is a
+pure operator intent update; current usage and dependencies independently decide when the next claim is admitted.
 
 Changing a threshold updates only the protected batch and writes a control event. A transient usage-probe failure is
 reported as usage unavailable and fails closed: preview, start, resume, and retry cannot proceed, and runnable batches
@@ -332,9 +338,11 @@ filesystem namespace. Task containers likewise keep the image's default root use
 forcing `HOME`, `CODEX_HOME`, a read-only root, dropped capabilities, or `no-new-privileges`. Isolation still comes
 from task-scoped mounts and networks, the absence of a Docker-socket mount, and CPU, memory, and PID limits.
 
-Successful task containers and scoped networks are cleaned normally after report handoff. If evaluation
-infrastructure fails after a task starts, the Worker retains the exact container, scoped network, workspace, runtime,
-and logs for diagnosis; an operator removes those resources explicitly only after collecting evidence.
+Successful task containers and scoped networks are cleaned normally after report handoff. For a failed attempt, the
+Worker keeps immutable `/runs/<run-id>` evidence and archives private TokensFlow diagnostics under mode-0700
+`/data/powercontext-eval/private-incidents/<run-id>/`; only after export succeeds does it remove the exact disposable
+container, scoped network, and workspace. Inventory or ownership uncertainty defers cleanup and therefore defers the
+retry.
 
 ## Verify and operate
 
@@ -346,15 +354,17 @@ curl --fail --show-error http://100.88.99.11:8787/api/health
 
 Submitting work adds it to the SQLite-backed queue. The Worker supervisor runs the configured number of task-pair
 slots; every slot atomically leases at most one queued attempt for `POWERCONTEXT_EVAL_LEASE_SECONDS`. Polling is
-controlled by `POWERCONTEXT_EVAL_POLL_SECONDS`. A service crash causes systemd to restart it after five seconds. An
-interrupted lease is recovered independently after expiry; a batch infrastructure recovery fails closed by pausing
-new claims and preserving the failed attempt for diagnosis. The Web and Worker share only the SQLite database and can
-restart independently.
+controlled by `POWERCONTEXT_EVAL_POLL_SECONDS`. A service crash causes systemd to restart it after five seconds. Only
+the replacement Worker process that owns the process lock fences its predecessor's running attempts; ordinary claim
+traffic never steals an expired lease. The interrupted attempt follows the same evidence, cleanup, budget, and
+backoff lifecycle as other retryable failures. Web and Worker can restart independently, but new claims remain closed
+until both publish the same build revision and runtime schema version.
 
 Persistent state and artifacts live under `/data/powercontext-eval`:
 
 - Queue database: `/data/powercontext-eval/web/tasks.sqlite3`
 - Per-run artifacts: `/data/powercontext-eval/runs/`
+- Private compressed incident spools: `/data/powercontext-eval/private-incidents/`
 - Cached harness and dataset: `/data/powercontext-eval/cache/`
 - Checkout and frontend snapshot: `/data/powercontext-eval/deploy/powercontext/`
 
@@ -395,8 +405,10 @@ test -s /data/powercontext-eval/backups/tasks-before-batch-<timestamp>.sqlite3
 ```
 
 Record the exact prior checkout SHA, unit files, environment-file checksum, Web/Worker status, and restart counts.
-Deploy only the reviewed detached SHA, then initialize the schema by starting the Web process before the worker.
-Do not delete the backup after successful startup.
+Deploy only the reviewed detached SHA, then initialize the schema by starting Web before Worker. Restart both
+evaluation services for every code revision; `/api/health` must report identical non-unknown `web_revision` and
+`worker_revision`, identical schema versions, and `deployment_consistent: true` before work is admitted. Do not
+delete the backup after successful startup.
 
 ## Preflight and acceptance
 

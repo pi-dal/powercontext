@@ -132,6 +132,37 @@ class InvalidTreatment(PowerContextEvalError):
     """Observed evidence does not prove the requested treatment."""
 
 
+class PluginInspectionFailureReason(StrEnum):
+    """Fixed, non-sensitive reasons why isolated plugin inspection did not converge."""
+
+    TIMED_OUT = "timed_out"
+    INVALID_PLUGIN_SET = "invalid_plugin_set"
+
+
+_PLUGIN_INSPECTION_FAILURE_SUMMARIES = MappingProxyType(
+    {
+        PluginInspectionFailureReason.TIMED_OUT: "Isolated Codex plugin inspection timed out.",
+        PluginInspectionFailureReason.INVALID_PLUGIN_SET: "Isolated Codex home did not converge to one plugin.",
+    }
+)
+
+
+class PluginInspectionFailure(InvalidTreatment):
+    """A retryable failure from inspecting the isolated Codex plugin installation."""
+
+    def __init__(self, reason: PluginInspectionFailureReason) -> None:
+        if not isinstance(reason, PluginInspectionFailureReason):
+            raise TypeError("Plugin inspection failure reason must be classified")
+        self.reason = reason
+        super().__init__(_PLUGIN_INSPECTION_FAILURE_SUMMARIES[reason])
+
+    @property
+    def safe_summary(self) -> str:
+        """Return the fixed user-visible failure summary."""
+
+        return _PLUGIN_INSPECTION_FAILURE_SUMMARIES[self.reason]
+
+
 class ReadinessFailureReason(StrEnum):
     """Fixed, non-sensitive reasons why the isolated Server readiness gate failed."""
 
@@ -2414,7 +2445,7 @@ class DockerSut:
                 )
             except CommandTimedOut:
                 if time.monotonic() >= deadline:
-                    raise InvalidTreatment("Isolated Codex plugin inspection timed out") from None
+                    raise PluginInspectionFailure(PluginInspectionFailureReason.TIMED_OUT) from None
                 time.sleep(_PLUGIN_LIST_RETRY_SECONDS)
                 continue
             try:
@@ -2437,7 +2468,7 @@ class DockerSut:
                     raise TypeError
             except (json.JSONDecodeError, KeyError, TypeError):
                 if time.monotonic() >= deadline:
-                    raise InvalidTreatment("Isolated Codex home must contain exactly one plugin") from None
+                    raise PluginInspectionFailure(PluginInspectionFailureReason.INVALID_PLUGIN_SET) from None
                 time.sleep(_PLUGIN_LIST_RETRY_SECONDS)
                 continue
             return plugin_id, version

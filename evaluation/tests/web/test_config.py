@@ -15,7 +15,9 @@ from powercontext_eval.web.models import (
     ComparisonResponse,
     EvidenceResponse,
     FailureCategory,
+    FailureCode,
     ReportResponse,
+    RetryDisposition,
     TaskCreate,
     TaskPhase,
     TaskRecord,
@@ -580,9 +582,12 @@ def test_task_record_exposes_only_safe_failure_details() -> None:
         request=TaskCreate.model_validate(valid_task()),
         status=TaskStatus.FAILED,
         created_at=datetime(2026, 7, 29, tzinfo=UTC),
+        eligible_at=datetime(2026, 7, 29, tzinfo=UTC),
         started_at=datetime(2026, 7, 29, tzinfo=UTC),
         finished_at=datetime(2026, 7, 29, 0, 1, tzinfo=UTC),
         failure_category=FailureCategory.CODEX_EXECUTION,
+        failure_code=FailureCode.CODEX_EXECUTION,
+        retry_disposition=RetryDisposition.RETRY,
         failure_phase=TaskPhase.RUNNING_OFF,
         failure_summary="Codex did not complete. Inspect retained m0 logs.",
     )
@@ -597,6 +602,7 @@ def record_payload(status: TaskStatus) -> dict[str, object]:
         "request": TaskCreate.model_validate(valid_task()),
         "status": status,
         "created_at": datetime(2026, 7, 29, tzinfo=UTC),
+        "eligible_at": datetime(2026, 7, 29, tzinfo=UTC),
     }
 
 
@@ -673,6 +679,8 @@ def test_task_record_rejects_incoherent_lifecycle(status: TaskStatus, fields: di
                 "started_at": datetime(2026, 7, 29, tzinfo=UTC),
                 "finished_at": datetime(2026, 7, 29, tzinfo=UTC),
                 "failure_category": FailureCategory.CODEX_EXECUTION,
+                "failure_code": FailureCode.CODEX_EXECUTION,
+                "retry_disposition": RetryDisposition.RETRY,
                 "failure_phase": TaskPhase.RUNNING_OFF,
                 "failure_summary": "Codex did not complete.",
             },
@@ -683,6 +691,8 @@ def test_task_record_rejects_incoherent_lifecycle(status: TaskStatus, fields: di
                 "started_at": datetime(2026, 7, 29, tzinfo=UTC),
                 "finished_at": datetime(2026, 7, 29, tzinfo=UTC),
                 "failure_category": FailureCategory.WORKER_INTERRUPTION,
+                "failure_code": FailureCode.WORKER_INTERRUPTION,
+                "retry_disposition": RetryDisposition.RETRY,
                 "failure_phase": TaskPhase.RUNNING_ON,
                 "failure_summary": "Worker lease expired.",
             },
@@ -701,6 +711,8 @@ def test_failed_task_accepts_safe_failure_without_phase() -> None:
             "started_at": datetime(2026, 7, 29, tzinfo=UTC),
             "finished_at": datetime(2026, 7, 29, 0, 1, tzinfo=UTC),
             "failure_category": FailureCategory.INTERNAL,
+            "failure_code": FailureCode.INTERNAL,
+            "retry_disposition": RetryDisposition.RETRY,
             "failure_summary": "The worker failed unexpectedly.",
         }
     )

@@ -27,7 +27,16 @@ from powercontext_eval.benchmarks.swebench_pro.gold_overrides import (
 from powercontext_eval.report import ArmReport, GoldValidationAudit, MetricSet, ReportBundle, TestGroupReport
 from powercontext_eval.web.api import TaskEventStream, create_app
 from powercontext_eval.web.config import WebConfig
-from powercontext_eval.web.models import FailureCategory, SafeFailure, TaskCreate, TaskPhase, TaskRecord, TaskResult
+from powercontext_eval.web.models import (
+    FailureCategory,
+    FailureCode,
+    RetryDisposition,
+    SafeFailure,
+    TaskCreate,
+    TaskPhase,
+    TaskRecord,
+    TaskResult,
+)
 from powercontext_eval.web.resources import FilesystemCapacity, ResourceUnavailable
 from powercontext_eval.web.store import FinalizationState, TaskStore, TokensFlowFinalizationCreate
 from powercontext_eval.web.usage import UsageSnapshot
@@ -88,6 +97,16 @@ def client(config: WebConfig, store: TaskStore) -> TestClient:
     return TestClient(create_app(config, store))
 
 
+def _complete_failed_attempt_cleanup(store: TaskStore, task_id: str, *, now: datetime) -> bool:
+    candidate = next(
+        candidate
+        for candidate in store.list_attempt_cleanup_candidates(limit=100, now=now)
+        if candidate.task_id == task_id
+    )
+    store.mark_attempt_evidence_exported(candidate.attempt_id)
+    return store.complete_attempt_cleanup_and_schedule_retry(candidate.attempt_id, now=now)
+
+
 def assert_safe(response: Response) -> None:
     assert SECRET not in response.text
 
@@ -104,6 +123,11 @@ def test_health_and_capabilities_are_server_owned_and_secret_free(client: TestCl
     assert health_payload.pop("filesystem_free_inodes") > 0
     assert health_payload.pop("filesystem_total_inodes") > 0
     assert health_payload.pop("filesystem_min_free_inodes") == 1_000_000
+    assert health_payload.pop("web_revision") != "unknown"
+    assert health_payload.pop("worker_revision") is None
+    assert health_payload.pop("web_schema_version") == 2
+    assert health_payload.pop("worker_schema_version") is None
+    assert health_payload.pop("deployment_consistent") is False
     assert health_payload == {
         "service": "ok",
         "worker_lease_active": False,
@@ -233,10 +257,20 @@ def test_removed_model_remains_readable_runnable_and_retryable_for_existing_batc
         "legacy-model-worker",
         SafeFailure(
             category=FailureCategory.CODEX_EXECUTION,
+            failure_code=FailureCode.CODEX_EXECUTION,
             phase=TaskPhase.RUNNING_OFF,
             summary="Codex execution did not complete",
+            retry_disposition=RetryDisposition.TERMINAL,
         ),
         now=started + timedelta(seconds=1),
+    )
+    assert (
+        _complete_failed_attempt_cleanup(
+            store,
+            task.task_id,
+            now=started + timedelta(seconds=2),
+        )
+        is False
     )
 
     current_client = TestClient(create_app(config, store, catalog=_BatchCatalog()))
@@ -312,6 +346,11 @@ def test_health_reads_four_active_pairs_and_published_capacity_from_store(
     assert health_payload.pop("filesystem_free_inodes") > 0
     assert health_payload.pop("filesystem_total_inodes") > 0
     assert health_payload.pop("filesystem_min_free_inodes") == 1_000_000
+    assert health_payload.pop("web_revision") != "unknown"
+    assert health_payload.pop("worker_revision") is None
+    assert health_payload.pop("web_schema_version") == 2
+    assert health_payload.pop("worker_schema_version") is None
+    assert health_payload.pop("deployment_consistent") is False
     assert health_payload == {
         "service": "ok",
         "worker_lease_active": True,
@@ -404,7 +443,7 @@ def test_cancel_queued_and_reject_running_or_terminal(client: TestClient, store:
     queued = client.post("/api/tasks", json=payload("cancel-key-1")).json()
     cancelled = client.post(f"/api/tasks/{queued['task_id']}/cancel")
     running = client.post("/api/tasks", json=payload("cancel-key-2")).json()
-    store.claim_next("worker", now=NOW)
+    store.claim_next("worker", now=datetime.now(UTC) + timedelta(seconds=1))
 
     terminal_conflict = client.post(f"/api/tasks/{queued['task_id']}/cancel")
     running_conflict = client.post(f"/api/tasks/{running['task_id']}/cancel")
@@ -1201,8 +1240,10 @@ def _finish_batch(
         "batch-worker",
         SafeFailure(
             category=FailureCategory.CODEX_EXECUTION,
+            failure_code=FailureCode.CODEX_EXECUTION,
             phase=TaskPhase.RUNNING_ON,
             summary="Codex execution did not complete",
+            retry_disposition=RetryDisposition.TERMINAL,
         ),
         now=started + timedelta(seconds=11),
     )
@@ -1520,10 +1561,20 @@ def test_batch_control_usage_attempt_and_retry_routes_are_durable(
         "batch-worker",
         SafeFailure(
             category=FailureCategory.CODEX_EXECUTION,
+            failure_code=FailureCode.CODEX_EXECUTION,
             phase=TaskPhase.RUNNING_OFF,
             summary="Codex execution did not complete",
+            retry_disposition=RetryDisposition.TERMINAL,
         ),
         now=started + timedelta(seconds=1),
+    )
+    assert (
+        _complete_failed_attempt_cleanup(
+            store,
+            task.task_id,
+            now=started + timedelta(seconds=2),
+        )
+        is False
     )
     retry_request = {"idempotency_key": "api-retry-0001"}
     retried = client.post(
@@ -1613,8 +1664,8 @@ def test_batch_report_reconciles_resolution_pairs_failures_and_total_tokens(
     }
     assert report["tokens"]["output"]["off"] == 44
     assert report["tokens"]["total"]["on"] == 478
-    assert report["control"]["intent"] == "pause"
-    assert report["control"]["pause_reason"] == "infrastructure_failure"
+    assert report["control"]["intent"] == "run"
+    assert report["control"]["pause_reason"] is None
     assert report["latest_usage"]["used_percent"] == 9
     assert report["estimate"] == {
         "quality": "preliminary",
@@ -1779,7 +1830,7 @@ def test_batch_report_uses_the_successful_retry_once_and_reads_its_attempt_artif
     config: WebConfig,
     store: TaskStore,
 ) -> None:
-    catalog = _BatchCatalog()
+    catalog = _BatchCatalog(("instance_org__repo-a",))
     client = TestClient(create_app(config, store, catalog=catalog))
     batch = client.post("/api/batches", json=_batch_payload("batch-retry-report-key")).json()
     task = store.list_batch_tasks(batch["batch_id"])[0]
@@ -1791,10 +1842,20 @@ def test_batch_report_uses_the_successful_retry_once_and_reads_its_attempt_artif
         "batch-worker",
         SafeFailure(
             category=FailureCategory.CODEX_EXECUTION,
+            failure_code=FailureCode.CODEX_EXECUTION,
             phase=TaskPhase.RUNNING_OFF,
             summary="First attempt failed",
+            retry_disposition=RetryDisposition.TERMINAL,
         ),
         now=started + timedelta(seconds=1),
+    )
+    assert (
+        _complete_failed_attempt_cleanup(
+            store,
+            task.task_id,
+            now=started + timedelta(seconds=2),
+        )
+        is False
     )
     retry, created = store.retry_failed_task(
         batch["batch_id"],
@@ -1805,7 +1866,6 @@ def test_batch_report_uses_the_successful_retry_once_and_reads_its_attempt_artif
     assert created is True
     store.request_resume(
         batch["batch_id"],
-        snapshot=_usage(9, observed_at=started + timedelta(seconds=3)),
         now=started + timedelta(seconds=3),
     )
     claimed_retry = store.claim_next("batch-worker", now=started + timedelta(seconds=3))

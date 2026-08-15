@@ -39,6 +39,8 @@ from powercontext_eval.powercontext_sut import (
     ContainerLimits,
     DockerSut,
     InvalidTreatment,
+    PluginInspectionFailure,
+    PluginInspectionFailureReason,
     ProxyRelayConfig,
     ReadinessFailure,
     ReadinessFailureReason,
@@ -909,8 +911,10 @@ def test_plugin_list_reports_exhausted_command_timeout(tmp_path: Path, monkeypat
     monotonic = iter((0.0, 121.0))
     monkeypatch.setattr(powercontext_sut.time, "monotonic", lambda: next(monotonic))
 
-    with pytest.raises(InvalidTreatment, match="plugin inspection timed out"):
+    with pytest.raises(PluginInspectionFailure) as captured:
         DockerSut(TimedOutDocker())._plugin_list("container", make_paths(tmp_path))
+    assert captured.value.reason is PluginInspectionFailureReason.TIMED_OUT
+    assert captured.value.safe_summary == "Isolated Codex plugin inspection timed out."
 
 
 def test_plugin_list_fails_closed_after_transient_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -921,8 +925,10 @@ def test_plugin_list_fails_closed_after_transient_budget(tmp_path: Path, monkeyp
     monotonic = iter((0.0, 121.0))
     monkeypatch.setattr(powercontext_sut.time, "monotonic", lambda: next(monotonic))
 
-    with pytest.raises(InvalidTreatment, match="exactly one plugin"):
+    with pytest.raises(PluginInspectionFailure) as captured:
         DockerSut(InvalidDocker())._plugin_list("container", make_paths(tmp_path))
+    assert captured.value.reason is PluginInspectionFailureReason.INVALID_PLUGIN_SET
+    assert captured.value.safe_summary == "Isolated Codex home did not converge to one plugin."
 
 
 def test_sut_transcript_has_hardening_mount_allowlist_shared_network_and_scope(tmp_path: Path) -> None:

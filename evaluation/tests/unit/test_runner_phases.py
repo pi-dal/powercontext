@@ -303,6 +303,9 @@ def _run_with_fakes(
     image_cleanup_attempts = 0
 
     class FakeProcess:
+        def __init__(self, *, default_cancel_event: object = None) -> None:
+            observed["default_cancel_event"] = default_cancel_event
+
         def run(self, argv: tuple[str, ...], **kwargs: object) -> SimpleNamespace:
             nonlocal image_cleanup_attempts, image_loaded
             process_calls.append((argv, kwargs))

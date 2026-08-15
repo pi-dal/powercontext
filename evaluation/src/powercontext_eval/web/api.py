@@ -55,6 +55,7 @@ from powercontext_eval.web.reporting import (
     load_report,
 )
 from powercontext_eval.web.resources import FilesystemResourceProbe, ResourceProbe, ResourceUnavailable
+from powercontext_eval.web.revision import RUNTIME_SCHEMA_VERSION, current_build_revision
 from powercontext_eval.web.store import BatchNotFound, TaskAdmissionRejected, TaskConflict, TaskNotFound, TaskStore
 from powercontext_eval.web.usage import UsageSnapshot, is_fresh
 
@@ -336,8 +337,18 @@ def create_app(
     resource_probe: ResourceProbe | None = None,
 ) -> FastAPI:
     """Create an API application; evaluation execution remains worker-owned."""
-    task_store = store or TaskStore(config.database_path, lease_duration=timedelta(seconds=config.lease_seconds))
+    task_store = store or TaskStore(
+        config.database_path,
+        lease_duration=timedelta(seconds=config.lease_seconds),
+        max_attempts=config.max_attempts,
+    )
     task_store.initialize()
+    task_store.record_runtime_revision(
+        "web",
+        build_revision=current_build_revision(),
+        schema_version=RUNTIME_SCHEMA_VERSION,
+        now=datetime.now(UTC),
+    )
     benchmark_catalog = catalog
     powercontext_source = GitSource(cache_root=config.run_root / "cache" / "powercontext-git")
     filesystem_probe = resource_probe or FilesystemResourceProbe(config.run_root)
@@ -417,6 +428,7 @@ def create_app(
     @app.get("/api/health")
     def health() -> HealthResponse:
         queue_health = task_store.health_snapshot(now=datetime.now(UTC))
+        deployment = task_store.deployment_snapshot()
         task_parallelism = queue_health["task_parallelism"]
         min_free_bytes = config.filesystem_min_free_bytes_for(task_parallelism)
         min_free_inodes = config.filesystem_min_free_inodes_for(task_parallelism)
@@ -431,6 +443,7 @@ def create_app(
         return HealthResponse(
             service="ok",
             **queue_health,
+            **deployment,
             resource_admission_open=admission_open,
             filesystem_free_bytes=None if capacity is None else capacity.free_bytes,
             filesystem_total_bytes=None if capacity is None else capacity.total_bytes,
@@ -566,21 +579,8 @@ def create_app(
 
     @app.post("/api/batches/{batch_id}/resume")
     def resume_batch(batch_id: str) -> Response:
-        snapshot = current_usage()
-        if snapshot is None:
-            return _error(503, "usage_unavailable", "Current Codex subscription usage is unavailable.")
         try:
-            batch = task_store.get_batch(batch_id)
-            if (
-                snapshot.rate_limit_reached_type is not None
-                or snapshot.used_percent >= batch.control.usage_pause_percent
-            ):
-                return _error(
-                    409,
-                    "usage_threshold_reached",
-                    "Current Codex subscription usage is at or above the batch threshold.",
-                )
-            record = task_store.request_resume(batch_id, snapshot=snapshot, now=datetime.now(UTC))
+            record = task_store.request_resume(batch_id, now=datetime.now(UTC))
         except BatchNotFound:
             return _error(404, "batch_not_found", "The requested evaluation batch does not exist.")
         except TaskConflict:
@@ -745,6 +745,8 @@ def create_app(
                 "finished_at": attempt.finished_at,
                 "version": attempt.version,
                 "failure_category": attempt.failure_category,
+                "failure_code": attempt.failure_code,
+                "retry_disposition": attempt.retry_disposition,
                 "failure_phase": attempt.failure_phase,
                 "failure_summary": attempt.failure_summary,
                 "result": attempt.result,

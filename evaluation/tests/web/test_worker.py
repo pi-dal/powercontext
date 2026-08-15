@@ -19,6 +19,8 @@ from powercontext_eval.errors import CommandFailed, GitSourceError
 from powercontext_eval.models import Arm
 from powercontext_eval.powercontext_sut import (
     InvalidTreatment,
+    PluginInspectionFailure,
+    PluginInspectionFailureReason,
     ReadinessFailure,
     ReadinessFailureReason,
     UnsafeSutConfiguration,
@@ -29,9 +31,18 @@ from powercontext_eval.tokensflow import TokensFlowFinalizationDescriptor, Token
 from powercontext_eval.web.batches import BatchControlEventType, BatchCreate, BatchStatus
 from powercontext_eval.web.config import WebConfig
 from powercontext_eval.web.controls import BatchControlIntent, BatchPauseReason
-from powercontext_eval.web.models import FailureCategory, SafeFailure, TaskCreate, TaskPhase, TaskStatus
+from powercontext_eval.web.models import (
+    FailureCategory,
+    FailureCode,
+    RetryDisposition,
+    SafeFailure,
+    TaskCreate,
+    TaskPhase,
+    TaskStatus,
+)
 from powercontext_eval.web.resources import FilesystemCapacity, FilesystemResourceProbe
-from powercontext_eval.web.store import TaskStore
+from powercontext_eval.web.revision import RUNTIME_SCHEMA_VERSION, current_build_revision
+from powercontext_eval.web.store import TaskOwnershipError, TaskStore
 from powercontext_eval.web.usage import CodexUsageProbe, UsageSnapshot, UsageUnavailable
 from powercontext_eval.web.worker import EvaluationWorker, TaskPairWorker
 
@@ -81,6 +92,7 @@ def _default_safe_usage_probe(monkeypatch: pytest.MonkeyPatch) -> None:
             total_inodes=200_000_000,
         ),
     )
+    monkeypatch.setattr("powercontext_eval.web.resources.DockerDependencyProbe.check", lambda _self: None)
 
 
 def _config(
@@ -90,11 +102,11 @@ def _config(
     poll_seconds: float = 0.01,
     usage_probe_seconds: int = 60,
     task_parallelism: int = 1,
-    codex_capacity_retry_max: int = 5,
+    max_attempts: int = 5,
 ) -> WebConfig:
     return WebConfig.for_root(
         root,
-        codex_capacity_retry_max=codex_capacity_retry_max,
+        max_attempts=max_attempts,
         tokensflow_egress_network="bridge",
         run_root=root / "artifacts",
         powercontext_source=root / "source",
@@ -115,8 +127,18 @@ def _config(
 
 
 def _store(config: WebConfig) -> TaskStore:
-    store = TaskStore(config.database_path, lease_duration=timedelta(seconds=config.lease_seconds))
+    store = TaskStore(
+        config.database_path,
+        lease_duration=timedelta(seconds=config.lease_seconds),
+        max_attempts=config.max_attempts,
+    )
     store.initialize()
+    store.record_runtime_revision(
+        "web",
+        build_revision=current_build_revision(),
+        schema_version=RUNTIME_SCHEMA_VERSION,
+        now=NOW,
+    )
     return store
 
 
@@ -222,7 +244,7 @@ def _unexpected_runner(calls: list[str]) -> Callable[..., MinimalRunResult]:
     return runner
 
 
-def test_worker_pauses_before_claim_when_usage_reaches_configured_threshold(tmp_path: Path) -> None:
+def test_worker_usage_threshold_blocks_claim_without_pausing_batch(tmp_path: Path) -> None:
     config = _config(tmp_path)
     store = _store(config)
     batch = _create_batch(store, instance_ids=("instance_owner__repo-a",))
@@ -239,10 +261,10 @@ def test_worker_pauses_before_claim_when_usage_reaches_configured_threshold(tmp_
 
     assert worker.run_once() is False
     assert calls == []
-    paused = store.get_batch(batch.batch_id)
-    assert paused.status is BatchStatus.PAUSED
-    assert paused.control.intent is BatchControlIntent.PAUSE
-    assert paused.control.pause_reason is BatchPauseReason.USAGE_THRESHOLD
+    current = store.get_batch(batch.batch_id)
+    assert current.status is BatchStatus.QUEUED
+    assert current.control.intent is BatchControlIntent.RUN
+    assert current.control.pause_reason is None
     assert store.latest_usage_snapshot() == _usage(80)
 
 
@@ -251,7 +273,16 @@ def test_worker_reuses_usage_until_the_snapshot_max_age_expires(tmp_path: Path) 
     store = _store(config)
     store.save_usage_snapshot(_usage(10, observed_at=NOW))
     probe = FakeUsageProbe([_usage(11), _usage(12)])
-    observations = iter((NOW + timedelta(seconds=119), NOW + timedelta(seconds=121)))
+    observations = iter(
+        (
+            NOW + timedelta(seconds=119),
+            NOW + timedelta(seconds=119),
+            NOW + timedelta(seconds=119),
+            NOW + timedelta(seconds=121),
+            NOW + timedelta(seconds=121),
+            NOW + timedelta(seconds=121),
+        )
+    )
     worker = EvaluationWorker(
         config,
         store,
@@ -378,7 +409,7 @@ def test_worker_skips_paused_oldest_batch_and_claims_next_runnable_batch(tmp_pat
     assert store.list_batch_tasks(oldest.batch_id)[0].status is TaskStatus.QUEUED
 
 
-def test_worker_fails_closed_when_usage_is_unavailable(tmp_path: Path) -> None:
+def test_worker_usage_unavailable_blocks_claim_without_pausing_batch(tmp_path: Path) -> None:
     config = _config(tmp_path)
     store = _store(config)
     batch = _create_batch(store, instance_ids=("instance_owner__repo-a",))
@@ -396,9 +427,9 @@ def test_worker_fails_closed_when_usage_is_unavailable(tmp_path: Path) -> None:
     assert worker.run_once() is False
 
     assert calls == []
-    paused = store.get_batch(batch.batch_id)
-    assert paused.status is BatchStatus.PAUSED
-    assert paused.control.pause_reason is BatchPauseReason.USAGE_UNAVAILABLE
+    current = store.get_batch(batch.batch_id)
+    assert current.status is BatchStatus.QUEUED
+    assert current.control.pause_reason is None
 
 
 def test_worker_executes_only_the_new_attempt_when_a_failed_task_is_retried(tmp_path: Path) -> None:
@@ -418,14 +449,11 @@ def test_worker_executes_only_the_new_attempt_when_a_failed_task_is_retried(tmp_
         ),
         now=NOW,
     )
-    retry, created = store.retry_failed_task(
-        batch.batch_id,
-        task.task_id,
-        idempotency_key="retry-worker-0001",
-        now=NOW,
-    )
-    assert created is True
-    store.request_resume(batch.batch_id, snapshot=_usage(9), now=NOW)
+    candidate = store.list_attempt_cleanup_candidates(limit=1, now=NOW)[0]
+    store.mark_attempt_evidence_exported(candidate.attempt_id)
+    assert store.complete_attempt_cleanup_and_schedule_retry(candidate.attempt_id, now=NOW) is True
+    retry = store.list_task_attempts(batch.batch_id, task.task_id)[-1]
+    store.request_resume(batch.batch_id, now=NOW)
     calls: list[str] = []
 
     def runner(run_config: Any, *, instance: object, on_phase: Any) -> MinimalRunResult:
@@ -440,7 +468,7 @@ def test_worker_executes_only_the_new_attempt_when_a_failed_task_is_retried(tmp_
         runner=runner,
         source=FakeSource(),
         catalog=FakeCatalog(("instance_owner__repo-a",)),
-        clock=lambda: NOW,
+        clock=lambda: NOW + timedelta(seconds=31),
     )
 
     assert worker.run_once() is True
@@ -448,7 +476,7 @@ def test_worker_executes_only_the_new_attempt_when_a_failed_task_is_retried(tmp_
     assert retry.attempt_id == f"{task.task_id}.attempt-0002"
     assert calls == [f"{task.task_id}-attempt-0002"]
     attempts = store.list_task_attempts(batch.batch_id, task.task_id)
-    assert [attempt.status for attempt in attempts] == [TaskStatus.FAILED, TaskStatus.FAILED]
+    assert [attempt.status for attempt in attempts] == [TaskStatus.FAILED, TaskStatus.FAILED, TaskStatus.QUEUED]
     assert attempts[0].failure_summary == "First attempt failed"
 
 
@@ -561,7 +589,7 @@ def test_only_one_child_runs_physically_across_multiple_batches(tmp_path: Path) 
     assert calls == [store.list_batch_tasks(first_batch.batch_id)[0].task_id]
 
 
-def test_failed_batch_child_pauses_later_children(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_failed_batch_child_does_not_block_later_children(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config = _config(tmp_path)
     store = _store(config)
     instance_ids = ("instance_owner__repo-a", "instance_owner__repo-b")
@@ -590,14 +618,14 @@ def test_failed_batch_child_pauses_later_children(monkeypatch: pytest.MonkeyPatc
     )
 
     assert worker.run_once() is True
-    assert worker.run_once() is False
+    assert worker.run_once() is True
 
     children = store.list_batch_tasks(batch.batch_id)
-    assert [child.status for child in children] == [TaskStatus.FAILED, TaskStatus.QUEUED]
+    assert [child.status for child in children] == [TaskStatus.QUEUED, TaskStatus.SUCCEEDED]
     current = store.get_batch(batch.batch_id)
-    assert current.status is BatchStatus.PAUSED
-    assert current.control.intent is BatchControlIntent.PAUSE
-    assert current.control.pause_reason is BatchPauseReason.INFRASTRUCTURE_FAILURE
+    assert current.status is BatchStatus.RUNNING
+    assert current.control.intent is BatchControlIntent.RUN
+    assert current.control.pause_reason is None
 
 
 def _capacity_worker(
@@ -658,12 +686,23 @@ def test_upstream_capacity_failure_requeues_the_child_without_pausing_the_batch(
     assert retry_events[0].details["reason"] == "codex_capacity"
 
     assert worker.run_once() is True
+    children = store.list_batch_tasks(batch.batch_id)
+    assert [child.status for child in children] == [TaskStatus.QUEUED, TaskStatus.SUCCEEDED]
+    retry_worker = EvaluationWorker(
+        config,
+        store,
+        runner=runner,
+        source=FakeSource(),
+        catalog=FakeCatalog(instance_ids),
+        clock=lambda: NOW + timedelta(seconds=31),
+    )
+    assert retry_worker.run_once() is True
     assert store.list_batch_tasks(batch.batch_id)[0].status is TaskStatus.SUCCEEDED
-    assert calls[1].endswith("-attempt-0002")
+    assert calls[2].endswith("-attempt-0002")
 
 
-def test_capacity_failures_pause_the_batch_once_the_retry_budget_is_spent(tmp_path: Path) -> None:
-    config = _config(tmp_path, codex_capacity_retry_max=1)
+def test_capacity_failures_exhaust_budget_without_pausing_or_blocking_siblings(tmp_path: Path) -> None:
+    config = _config(tmp_path, max_attempts=1)
     store = _store(config)
     instance_ids = ("instance_owner__repo-a", "instance_owner__repo-b")
     batch = _create_batch(store, instance_ids=instance_ids)
@@ -679,17 +718,19 @@ def test_capacity_failures_pause_the_batch_once_the_retry_budget_is_spent(tmp_pa
 
     assert worker.run_once() is True
 
-    failed = store.list_batch_tasks(batch.batch_id)[0]
-    assert failed.status is TaskStatus.FAILED
-    assert failed.failure_category is FailureCategory.CODEX_CAPACITY
-    assert failed.retryable is True
+    failed = store.list_batch_tasks(batch.batch_id)
+    assert [task.status for task in failed] == [TaskStatus.FAILED, TaskStatus.FAILED]
+    assert all(task.failure_category is FailureCategory.CODEX_CAPACITY for task in failed)
+    assert all(task.retryable is False for task in failed)
     current = store.get_batch(batch.batch_id)
-    assert current.status is BatchStatus.PAUSED
-    assert current.control.pause_reason is BatchPauseReason.CODEX_CAPACITY
+    assert current.status is BatchStatus.COMPLETED
+    assert current.control.intent is BatchControlIntent.RUN
+    assert current.control.pause_reason is None
 
-    attempts = store.list_task_attempts(batch.batch_id, failed.task_id)
-    assert [attempt.attempt_number for attempt in attempts] == [1, 2]
-    assert all(attempt.failure_category is FailureCategory.CODEX_CAPACITY for attempt in attempts)
+    for task in failed:
+        attempts = store.list_task_attempts(batch.batch_id, task.task_id)
+        assert [attempt.attempt_number for attempt in attempts] == [1]
+        assert attempts[0].failure_category is FailureCategory.CODEX_CAPACITY
 
 
 def test_capacity_failure_never_resumes_a_batch_the_user_paused(tmp_path: Path) -> None:
@@ -728,7 +769,7 @@ def test_capacity_failure_never_queues_another_attempt_for_a_cancelling_batch(tm
     assert store.list_task_attempts(batch.batch_id, child.task_id)[-1].attempt_number == 1
 
 
-def test_tokensflow_drain_failure_is_recorded_and_pauses_batch_atomically(tmp_path: Path) -> None:
+def test_tokensflow_drain_failure_is_recorded_without_pausing_batch(tmp_path: Path) -> None:
     config = _config(tmp_path)
     store = _store(config)
     instance_ids = ("instance_owner__repo-a", "instance_owner__repo-b")
@@ -749,15 +790,17 @@ def test_tokensflow_drain_failure_is_recorded_and_pauses_batch_atomically(tmp_pa
 
     assert worker.run_once() is True
 
-    failed, queued = store.list_batch_tasks(batch.batch_id)
-    assert failed.status is TaskStatus.FAILED
-    assert failed.failure_category is FailureCategory.CODEX_EXECUTION
-    assert failed.failure_summary == "Codex execution failed."
+    retried, queued = store.list_batch_tasks(batch.batch_id)
+    assert retried.status is TaskStatus.QUEUED
+    attempts = store.list_task_attempts(batch.batch_id, retried.task_id)
+    assert [attempt.status for attempt in attempts] == [TaskStatus.FAILED, TaskStatus.QUEUED]
+    assert attempts[0].failure_category is FailureCategory.CODEX_EXECUTION
+    assert attempts[0].failure_summary == "Codex execution failed."
     assert queued.status is TaskStatus.QUEUED
     current = store.get_batch(batch.batch_id)
-    assert current.status is BatchStatus.PAUSED
-    assert current.control.intent is BatchControlIntent.PAUSE
-    assert current.control.pause_reason is BatchPauseReason.INFRASTRUCTURE_FAILURE
+    assert current.status is BatchStatus.QUEUED
+    assert current.control.intent is BatchControlIntent.RUN
+    assert current.control.pause_reason is None
 
 
 def test_restart_reuses_persisted_batch_sha_and_completed_children(
@@ -923,22 +966,26 @@ def test_worker_never_repairs_a_symlink_lock_target(tmp_path: Path) -> None:
         (
             UnsafeSutConfiguration("secret"),
             FailureCategory.ENVIRONMENT_PREPARATION,
-            "Evaluation environment preparation failed.",
+            "Evaluation SUT configuration is unsafe.",
         ),
         (
             DatasetSchemaError("secret"),
             FailureCategory.ENVIRONMENT_PREPARATION,
-            "Evaluation environment preparation failed.",
+            "Evaluation dataset schema is invalid.",
         ),
         (GoldCheckFailed("secret"), FailureCategory.GOLD_VALIDATION, "Gold patch validation failed."),
-        (CodexInfrastructureError("secret"), FailureCategory.CODEX_EXECUTION, "Codex execution failed."),
+        (
+            CodexInfrastructureError("secret"),
+            FailureCategory.CODEX_EXECUTION,
+            "Codex execution infrastructure failed.",
+        ),
         (
             ReadinessFailure(ReadinessFailureReason.COMMAND_TIMED_OUT),
             FailureCategory.TREATMENT_VALIDATION,
             "PowerContext readiness probe timed out.",
         ),
         (
-            InvalidTreatment("Isolated Codex plugin inspection timed out"),
+            PluginInspectionFailure(PluginInspectionFailureReason.TIMED_OUT),
             FailureCategory.TREATMENT_VALIDATION,
             "Isolated Codex plugin inspection timed out.",
         ),
@@ -963,6 +1010,28 @@ def test_known_failures_have_fixed_safe_mapping(
     failed = store.get(task.task_id)
     assert failed.failure_category is category
     assert failed.failure_summary == summary
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [PluginInspectionFailureReason.TIMED_OUT, PluginInspectionFailureReason.INVALID_PLUGIN_SET],
+)
+def test_plugin_inspection_failures_are_retryable_with_a_stable_subcode(
+    tmp_path: Path,
+    reason: PluginInspectionFailureReason,
+) -> None:
+    config = _config(tmp_path)
+    store = _store(config)
+    task = _create(store)
+
+    def runner(config: Any, *, on_phase: Any) -> MinimalRunResult:
+        raise PluginInspectionFailure(reason)
+
+    assert EvaluationWorker(config, store, runner=runner, clock=lambda: NOW).run_once() is True
+    failed = store.get(task.task_id)
+    assert failed.failure_code is FailureCode.PLUGIN_INSPECTION
+    assert failed.retry_disposition is RetryDisposition.RETRY
+    assert failed.retryable is True
 
 
 def test_unknown_failure_never_persists_exception_text(
@@ -1195,79 +1264,59 @@ def test_heartbeat_start_failure_is_safely_persisted_and_run_forever_continues(t
     assert waits == [config.poll_seconds]
 
 
-def test_ownership_loss_prevents_stale_worker_mutation(tmp_path: Path) -> None:
+def test_ownership_loss_cancels_runner_and_startup_recovery_fences_attempt(tmp_path: Path) -> None:
     config = _config(tmp_path, lease_seconds=1)
     store = _store(config)
     task = _create(store)
     later = NOW + timedelta(seconds=2)
 
     def runner(run_config: Any, *, on_phase: Any) -> MinimalRunResult:
-        assert store.recover_expired(now=later) == [task.task_id]
+        assert run_config.cancel_event is not None
+        original = store.set_phase
+
+        def lose_ownership(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            raise TaskOwnershipError("ownership changed")
+
+        store.set_phase = lose_ownership  # type: ignore[method-assign]
         on_phase(RunPhase.RUNNING_ON)
+        store.set_phase = original  # type: ignore[method-assign]
+        assert run_config.cancel_event.is_set()
         return MinimalRunResult(task.task_id, config.run_root / "runs" / task.task_id / "report.md", True, True)
 
-    times = iter((NOW, later, later))
-    assert EvaluationWorker(config, store, runner=runner, clock=lambda: next(times)).run_once() is True
+    assert EvaluationWorker(config, store, runner=runner, clock=lambda: NOW).run_once() is True
+    assert store.get(task.task_id).status is TaskStatus.RUNNING
+    assert store.begin_startup_recovery(now=later) == [task.task_id]
     record = store.get(task.task_id)
     assert record.status is TaskStatus.INTERRUPTED
     assert record.phase is None
     assert record.result is None
 
 
-def test_host_lock_prevents_recovery_and_second_runner_until_stale_process_releases(tmp_path: Path) -> None:
+def test_startup_recovery_fences_unexpired_predecessor_before_claiming_new_work(tmp_path: Path) -> None:
     config = _config(tmp_path, lease_seconds=1)
     store = _store(config)
     first_task = _create(store, key="first-task")
     second_task = _create(store, key="second-task")
-    later = NOW + timedelta(seconds=2)
-    entered = threading.Event()
-    release = threading.Event()
-    calls = []
-
-    def stale_runner(run_config: Any, *, on_phase: Any) -> MinimalRunResult:
-        calls.append(("first", run_config.run_id))
-        entered.set()
-        assert release.wait(timeout=2)
-        raise RuntimeError("stale runner returned")
+    claimed = store.claim_next("predecessor", now=NOW)
+    assert claimed is not None and claimed.task_id == first_task.task_id
+    calls: list[str] = []
 
     def successor_runner(run_config: Any, *, on_phase: Any) -> MinimalRunResult:
-        calls.append(("second", run_config.run_id))
+        del on_phase
+        calls.append(run_config.run_id)
         raise RuntimeError("successor ran")
 
-    def no_heartbeat(**kwargs: Any) -> RecordingThread:
-        return RecordingThread(**kwargs)
-
-    first_times = iter((NOW, later))
-    first = EvaluationWorker(
-        config,
-        store,
-        runner=stale_runner,
-        worker_id="first",
-        clock=lambda: next(first_times),
-        thread_factory=no_heartbeat,
-    )
     successor = EvaluationWorker(
         config,
         store,
         runner=successor_runner,
         worker_id="successor",
-        clock=lambda: later,
-        sleep=lambda seconds: successor.stop(),
+        clock=lambda: NOW,
     )
-    thread = threading.Thread(target=first.run_once)
-    thread.start()
-    assert entered.wait(timeout=2)
-
-    successor.run_forever()
-    assert store.get(first_task.task_id).status is TaskStatus.RUNNING
-    assert calls == [("first", first_task.task_id)]
-
-    release.set()
-    thread.join(timeout=2)
-    assert not thread.is_alive()
     assert successor.run_once() is True
     assert store.get(first_task.task_id).status is TaskStatus.INTERRUPTED
-    assert calls == [("first", first_task.task_id), ("second", second_task.task_id)]
+    assert calls == [second_task.task_id]
 
 
 @pytest.mark.parametrize(
@@ -1352,13 +1401,13 @@ def test_run_forever_recovers_once_and_waits_only_when_idle(
         sleep=wait,
     )
     recoveries = []
-    original = store.recover_expired
+    original = store.begin_startup_recovery
 
     def recover(*, now: datetime) -> list[str]:
         recoveries.append(now)
         return original(now=now)
 
-    monkeypatch.setattr(store, "recover_expired", recover)
+    monkeypatch.setattr(store, "begin_startup_recovery", recover)
     worker.run_forever()
 
     assert recoveries == [NOW]
@@ -1416,7 +1465,7 @@ def test_usage_refresher_supervisor_runs_independently_and_stops_promptly(tmp_pa
     assert observed == [(worker._stop, config.usage_probe_seconds)]
 
 
-def test_usage_refresher_supervisor_failure_pauses_runnable_batch_fail_closed(
+def test_usage_refresher_supervisor_failure_stops_worker_without_mutating_user_intent(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1437,17 +1486,13 @@ def test_usage_refresher_supervisor_failure_pauses_runnable_batch_fail_closed(
     supervisor = threading.Thread(target=worker.run_forever)
     supervisor.start()
     assert failed.wait(timeout=2)
-    deadline = time.monotonic() + 2
-    while store.get_batch(batch.batch_id).status is not BatchStatus.PAUSED and time.monotonic() < deadline:
-        time.sleep(0.01)
-
-    worker.stop()
     supervisor.join(timeout=2)
 
     assert not supervisor.is_alive()
-    paused = store.get_batch(batch.batch_id)
-    assert paused.status is BatchStatus.PAUSED
-    assert paused.control.pause_reason is BatchPauseReason.USAGE_UNAVAILABLE
+    current = store.get_batch(batch.batch_id)
+    assert current.status is BatchStatus.QUEUED
+    assert current.control.intent is BatchControlIntent.RUN
+    assert current.control.pause_reason is None
 
 
 @pytest.mark.parametrize("parallelism", [4, 10])
@@ -1607,7 +1652,7 @@ def test_second_full_supervisor_cannot_start_slots_while_process_lock_is_owned(t
     assert not first_thread.is_alive()
 
 
-def test_supervisor_surfaces_slot_failure_and_pauses_runnable_batch(
+def test_supervisor_surfaces_slot_failure_without_mutating_user_intent(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1615,19 +1660,19 @@ def test_supervisor_surfaces_slot_failure_and_pauses_runnable_batch(
     store = _store(config)
     batch = _create_batch(store, key="slot-failure", instance_ids=("instance_owner__repo-a",))
 
-    def fail_recovery(*, now: datetime) -> list[str]:
-        del now
+    def fail_slot(_stop: threading.Event | None = None) -> None:
         raise RuntimeError("private slot failure")
 
-    monkeypatch.setattr(store, "recover_expired", fail_recovery)
     worker = EvaluationWorker(config, store, clock=lambda: NOW)
+    monkeypatch.setattr(worker._slots[0], "run_forever", fail_slot)
 
     with pytest.raises(RuntimeError, match="Evaluation worker slot failed"):
         worker.run_forever()
 
-    paused = store.get_batch(batch.batch_id)
-    assert paused.status is BatchStatus.PAUSED
-    assert paused.control.pause_reason is BatchPauseReason.INFRASTRUCTURE_FAILURE
+    current = store.get_batch(batch.batch_id)
+    assert current.status is BatchStatus.QUEUED
+    assert current.control.intent is BatchControlIntent.RUN
+    assert current.control.pause_reason is None
 
 
 def test_supervisor_slot_failure_stops_replacements_joins_active_slots_and_raises_safely(
@@ -1735,7 +1780,8 @@ def test_supervisor_partial_thread_start_failure_stops_and_joins_started_slots(
 
     assert "private thread-start detail" not in str(raised.value)
     assert worker._stop.is_set()
-    assert len(wrappers) == 4
-    assert started == [1, 2]
-    assert joined == [1]
+    assert len(wrappers) == 5
+    assert started == [5, 1, 2]
+    assert joined == [1, 5]
     assert not wrappers[0].inner.is_alive()
+    assert not wrappers[4].inner.is_alive()

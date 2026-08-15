@@ -22,11 +22,16 @@ from powercontext_eval.benchmarks.swebench_pro.catalog import CatalogError, SweB
 from powercontext_eval.benchmarks.swebench_pro.evaluator import OfficialResultError
 from powercontext_eval.benchmarks.swebench_pro.prediction import BinaryPatchError
 from powercontext_eval.codex import CodexCapacityError, CodexInfrastructureError, UnsafeCodexInvocation
-from powercontext_eval.errors import CommandError, GitSourceError, PowerContextEvalError
+from powercontext_eval.errors import CommandCancelled, CommandError, GitSourceError, PowerContextEvalError
 from powercontext_eval.git_source import GitSource
 from powercontext_eval.models import PowerContextRef
 from powercontext_eval.paths import EvaluationPaths
-from powercontext_eval.powercontext_sut import InvalidTreatment, ReadinessFailure, UnsafeSutConfiguration
+from powercontext_eval.powercontext_sut import (
+    InvalidTreatment,
+    PluginInspectionFailure,
+    ReadinessFailure,
+    UnsafeSutConfiguration,
+)
 from powercontext_eval.process import ProcessRunner
 from powercontext_eval.report import InvalidReportBundle
 from powercontext_eval.runner import (
@@ -40,11 +45,19 @@ from powercontext_eval.runner import (
 from powercontext_eval.tokensflow import TokensFlowFinalizationDescriptor, TokensFlowFinalizationRegistrar
 from powercontext_eval.web.claiming import ClaimCoordinator, PeriodicUsageRefresher
 from powercontext_eval.web.config import WebConfig
-from powercontext_eval.web.controls import BatchPauseReason
 from powercontext_eval.web.finalization import DockerFinalizationRuntime, TokensFlowFinalizer
-from powercontext_eval.web.models import FailureCategory, SafeFailure, TaskPhase, TaskRecord, TaskResult
+from powercontext_eval.web.models import (
+    FailureCategory,
+    FailureCode,
+    RetryDisposition,
+    SafeFailure,
+    TaskPhase,
+    TaskRecord,
+    TaskResult,
+)
 from powercontext_eval.web.reporting import ReportingError, load_report
-from powercontext_eval.web.resources import ResourceProbe, default_workspace_reclaimer
+from powercontext_eval.web.resources import AttemptLifecycleCleaner, ResourceProbe, default_workspace_reclaimer
+from powercontext_eval.web.revision import RUNTIME_SCHEMA_VERSION, current_build_revision
 from powercontext_eval.web.store import (
     TaskConflict,
     TaskOwnershipError,
@@ -74,8 +87,6 @@ _TREATMENT_FAILURE_SUMMARIES = {
     "Codex CLI version does not match the pinned experiment": (
         "Codex CLI version did not match the pinned experiment."
     ),
-    "Isolated Codex plugin inspection timed out": "Isolated Codex plugin inspection timed out.",
-    "Isolated Codex home must contain exactly one plugin": "Isolated Codex home did not converge to one plugin.",
     "PowerContext SQLite evidence is malformed": "PowerContext SQLite treatment evidence was malformed.",
 }
 _LOGGER = logging.getLogger(__name__)
@@ -108,6 +119,12 @@ class FinalizerSupervisor(Protocol):
 
 
 class WorkspaceReclaimerSupervisor(Protocol):
+    def run_forever(self, stop: threading.Event) -> None: ...
+
+
+class AttemptLifecycleSupervisor(Protocol):
+    def run_once(self) -> int: ...
+
     def run_forever(self, stop: threading.Event) -> None: ...
 
 
@@ -193,7 +210,9 @@ class TaskPairWorker:
                     task,
                     SafeFailure(
                         category=FailureCategory.REPORT_GENERATION,
+                        failure_code=FailureCode.ARTIFACTS_ALREADY_EXIST,
                         summary="Evaluation artifacts already exist; refusing to overwrite them.",
+                        retry_disposition=RetryDisposition.TERMINAL,
                     ),
                     ownership_lost,
                 )
@@ -209,7 +228,7 @@ class TaskPairWorker:
                     return
                 phase = mapped
 
-            result = self._invoke_runner(task, on_phase)
+            result = self._invoke_runner(task, on_phase, ownership_lost)
             if ownership_lost.is_set():
                 return True
             task_result = self._validated_result(task, result)
@@ -230,11 +249,7 @@ class TaskPairWorker:
                 command_kind,
                 returncode,
             )
-            failure = _safe_failure(
-                error,
-                phase,
-                auto_retry_allowed=task.attempt_number <= self._config.codex_capacity_retry_max,
-            )
+            failure = _safe_failure(error, phase)
             attempt_finished = self._fail(task, failure, ownership_lost)
         finally:
             heartbeat_stop.set()
@@ -245,15 +260,20 @@ class TaskPairWorker:
         return True
 
     def run_forever(self, stop: threading.Event | None = None) -> None:
-        """Poll until stopped, recovering an expired predecessor before each claim."""
+        """Poll until stopped; process startup exclusively owns predecessor recovery."""
         stop_event = stop or self._stop
         while not stop_event.is_set():
             if not self.run_once():
                 self._sleep(self._config.poll_seconds)
 
-    def _invoke_runner(self, task: TaskRecord, on_phase: Callable[[RunPhase], None]) -> MinimalRunResult:
+    def _invoke_runner(
+        self,
+        task: TaskRecord,
+        on_phase: Callable[[RunPhase], None],
+        cancel_event: threading.Event,
+    ) -> MinimalRunResult:
         if task.batch_id is None:
-            return self._legacy_runner(self._legacy_run_config(task), on_phase=on_phase)
+            return self._legacy_runner(self._legacy_run_config(task, cancel_event), on_phase=on_phase)
         if task.instance_id is None:
             raise DatasetSchemaError("Batch child is missing an instance ID")
         catalog = self._catalog
@@ -261,12 +281,12 @@ class TaskPairWorker:
             catalog = SweBenchProCatalog.load(self._config.dataset_path)
             self._catalog = catalog
         return self._batch_runner(
-            self._batch_run_config(task),
+            self._batch_run_config(task, cancel_event),
             instance=catalog.require(task.instance_id),
             on_phase=on_phase,
         )
 
-    def _batch_run_config(self, task: TaskRecord) -> RunConfig:
+    def _batch_run_config(self, task: TaskRecord, cancel_event: threading.Event | None = None) -> RunConfig:
         if task.batch_id is None:
             raise ValueError("Batch run configuration requires a batch child")
         powercontext_ref = self._pinned_batch_ref(task.batch_id)
@@ -289,9 +309,10 @@ class TaskPairWorker:
             reasoning_effort=task.request.reasoning_effort,
             finalization_registrar=self._finalization_registrar(task),
             container_env=dict(task.request.container_env),
+            cancel_event=cancel_event,
         )
 
-    def _legacy_run_config(self, task: TaskRecord) -> MinimalRunConfig:
+    def _legacy_run_config(self, task: TaskRecord, cancel_event: threading.Event | None = None) -> MinimalRunConfig:
         return MinimalRunConfig(
             root=self._config.run_root,
             powercontext_source=self._config.powercontext_source,
@@ -311,6 +332,7 @@ class TaskPairWorker:
             model=task.request.model,
             reasoning_effort=task.request.reasoning_effort,
             finalization_registrar=self._finalization_registrar(task),
+            cancel_event=cancel_event,
         )
 
     def _finalization_registrar(self, task: TaskRecord) -> TokensFlowFinalizationRegistrar:
@@ -456,6 +478,7 @@ class EvaluationWorker:
         thread_factory: ThreadFactory = threading.Thread,
         finalizer: FinalizerSupervisor | None = None,
         workspace_reclaimer: WorkspaceReclaimerSupervisor | None = None,
+        attempt_lifecycle: AttemptLifecycleSupervisor | None = None,
         usage_refresher: UsageRefreshSupervisor | None = None,
         resource_probe: ResourceProbe | None = None,
     ) -> None:
@@ -475,6 +498,7 @@ class EvaluationWorker:
             usage_probe=shared_probe,
             clock=self._clock,
             resource_probe=resource_probe,
+            deployment_gate=store.deployment_admission_open,
         )
         self._coordinator = coordinator
         self._finalizer = finalizer or TokensFlowFinalizer(
@@ -484,6 +508,11 @@ class EvaluationWorker:
             task_parallelism=config.task_parallelism,
         )
         self._workspace_reclaimer = workspace_reclaimer or default_workspace_reclaimer(config, store)
+        self._attempt_lifecycle = attempt_lifecycle or AttemptLifecycleCleaner(
+            store,
+            config.run_root,
+            clock=self._clock,
+        )
         self._usage_refresher = usage_refresher or PeriodicUsageRefresher(coordinator)
         base_worker_id = worker_id or f"worker-{uuid4().hex}"
 
@@ -519,7 +548,14 @@ class EvaluationWorker:
         with _nonblocking_worker_lock(self._config.database_path) as locked:
             if not locked:
                 return False
-            return self._slots[0].run_once()
+            startup_now = self._clock()
+            self._publish_runtime_revision(now=startup_now)
+            recovered = self._store.begin_startup_recovery(now=startup_now)
+            if recovered:
+                self._attempt_lifecycle.run_once()
+            ran = self._slots[0].run_once()
+            self._attempt_lifecycle.run_once()
+            return ran
 
     def run_forever(self) -> None:
         """Own the process lock and supervise all configured task-pair slots."""
@@ -527,19 +563,13 @@ class EvaluationWorker:
         with _nonblocking_worker_lock(self._config.database_path) as locked:
             if not locked:
                 return
+            startup_now = self._clock()
+            self._publish_runtime_revision(now=startup_now)
+            self._store.begin_startup_recovery(now=startup_now)
+            self._attempt_lifecycle.run_once()
             self._store.record_worker_capacity(self._config.task_parallelism, now=self._clock())
             failures: list[BaseException] = []
             failures_lock = threading.Lock()
-
-            def pause_after_slot_failure() -> None:
-                try:
-                    self._store.pause_runnable_batches(
-                        reason=BatchPauseReason.INFRASTRUCTURE_FAILURE,
-                        now=self._clock(),
-                    )
-                except Exception as error:  # noqa: BLE001 - preserve the original supervisor failure too
-                    with failures_lock:
-                        failures.append(error)
 
             def run_slot(slot: TaskPairWorker) -> None:
                 try:
@@ -548,20 +578,16 @@ class EvaluationWorker:
                     with failures_lock:
                         failures.append(error)
                     self.stop()
-                    pause_after_slot_failure()
 
             def run_usage_refresher() -> None:
                 try:
                     self._usage_refresher.run_forever(self._stop, self._config.usage_probe_seconds)
                 except Exception as error:  # noqa: BLE001 - usage gating must fail closed on supervisor defects
-                    self._store.pause_runnable_batches(
-                        reason=BatchPauseReason.USAGE_UNAVAILABLE,
-                        now=self._clock(),
-                    )
                     _LOGGER.warning(
                         "Account usage refresher stopped unexpectedly (error_type=%s)",
                         type(error).__name__,
                     )
+                    self.stop()
 
             threads = tuple(
                 threading.Thread(
@@ -576,15 +602,24 @@ class EvaluationWorker:
             usage_refresh_thread: threading.Thread | None = None
             finalizer_thread: threading.Thread | None = None
             workspace_reclaimer_thread: threading.Thread | None = None
+            attempt_lifecycle_thread: threading.Thread | None = None
             try:
+                attempt_lifecycle_thread = threading.Thread(
+                    target=self._attempt_lifecycle.run_forever,
+                    args=(self._stop,),
+                    daemon=False,
+                    name="attempt-lifecycle-cleaner",
+                )
+                attempt_lifecycle_thread.start()
                 for thread in threads:
                     thread.start()
                     started.append(thread)
             except Exception:  # noqa: BLE001 - partial startup must stop and join every started slot
                 self.stop()
-                pause_after_slot_failure()
                 for thread in started:
                     thread.join()
+                if attempt_lifecycle_thread is not None:
+                    attempt_lifecycle_thread.join()
                 raise RuntimeError("Evaluation worker slot failed") from None
             try:
                 usage_refresh_thread = threading.Thread(
@@ -595,14 +630,11 @@ class EvaluationWorker:
                 usage_refresh_thread.start()
             except Exception as error:  # noqa: BLE001 - claims remain fail closed if refreshing cannot start
                 usage_refresh_thread = None
-                self._store.pause_runnable_batches(
-                    reason=BatchPauseReason.USAGE_UNAVAILABLE,
-                    now=self._clock(),
-                )
                 _LOGGER.warning(
                     "Account usage refresher failed to start (error_type=%s)",
                     type(error).__name__,
                 )
+                self.stop()
             try:
                 finalizer_thread = threading.Thread(
                     target=self._finalizer.run_forever,
@@ -639,8 +671,18 @@ class EvaluationWorker:
                 finalizer_thread.join()
             if workspace_reclaimer_thread is not None:
                 workspace_reclaimer_thread.join()
+            if attempt_lifecycle_thread is not None:
+                attempt_lifecycle_thread.join()
             if failures:
                 raise RuntimeError("Evaluation worker slot failed") from None
+
+    def _publish_runtime_revision(self, *, now: datetime) -> None:
+        self._store.record_runtime_revision(
+            "worker",
+            build_revision=current_build_revision(),
+            schema_version=RUNTIME_SCHEMA_VERSION,
+            now=now,
+        )
 
 
 def _execution_run_id(task: TaskRecord) -> str:
@@ -696,39 +738,125 @@ def _nonblocking_worker_lock(database_path: Path) -> Iterator[bool]:
         os.close(descriptor)
 
 
-def _safe_failure(error: Exception, phase: TaskPhase | None, *, auto_retry_allowed: bool = False) -> SafeFailure:
+def _safe_failure(error: Exception, phase: TaskPhase | None) -> SafeFailure:
+    if isinstance(error, CommandCancelled):
+        return SafeFailure(
+            category=FailureCategory.WORKER_INTERRUPTION,
+            failure_code=FailureCode.WORKER_INTERRUPTION,
+            phase=phase,
+            summary="Evaluation execution was interrupted after worker ownership changed.",
+        )
     if isinstance(error, CodexCapacityError):
         return SafeFailure(
             category=FailureCategory.CODEX_CAPACITY,
+            failure_code=FailureCode.CODEX_CAPACITY,
             phase=phase,
             summary="The upstream Codex model was at capacity.",
-            auto_retry=auto_retry_allowed,
         )
-    fixed: tuple[FailureCategory, str]
+    fixed: tuple[FailureCategory, FailureCode, str, RetryDisposition]
     if isinstance(error, GitSourceError):
-        fixed = FailureCategory.SOURCE_RESOLUTION, "PowerContext source resolution failed."
-    elif isinstance(error, (CatalogError, DatasetSchemaError, UnsafeSutConfiguration)):
-        fixed = FailureCategory.ENVIRONMENT_PREPARATION, "Evaluation environment preparation failed."
+        fixed = (
+            FailureCategory.SOURCE_RESOLUTION,
+            FailureCode.SOURCE_RESOLUTION,
+            "PowerContext source resolution failed.",
+            RetryDisposition.RETRY,
+        )
+    elif isinstance(error, CatalogError):
+        fixed = (
+            FailureCategory.ENVIRONMENT_PREPARATION,
+            FailureCode.CATALOG,
+            "Evaluation benchmark catalog is invalid.",
+            RetryDisposition.TERMINAL,
+        )
+    elif isinstance(error, DatasetSchemaError):
+        fixed = (
+            FailureCategory.ENVIRONMENT_PREPARATION,
+            FailureCode.DATASET_SCHEMA,
+            "Evaluation dataset schema is invalid.",
+            RetryDisposition.TERMINAL,
+        )
+    elif isinstance(error, UnsafeSutConfiguration):
+        fixed = (
+            FailureCategory.ENVIRONMENT_PREPARATION,
+            FailureCode.UNSAFE_SUT_CONFIGURATION,
+            "Evaluation SUT configuration is unsafe.",
+            RetryDisposition.TERMINAL,
+        )
     elif isinstance(error, GoldCheckFailed):
-        fixed = FailureCategory.GOLD_VALIDATION, "Gold patch validation failed."
-    elif isinstance(error, (CodexInfrastructureError, UnsafeCodexInvocation, BinaryPatchError)):
-        fixed = FailureCategory.CODEX_EXECUTION, "Codex execution failed."
+        fixed = (
+            FailureCategory.GOLD_VALIDATION,
+            FailureCode.GOLD_VALIDATION,
+            "Gold patch validation failed.",
+            RetryDisposition.RETRY,
+        )
+    elif isinstance(error, CodexInfrastructureError):
+        fixed = (
+            FailureCategory.CODEX_EXECUTION,
+            FailureCode.CODEX_EXECUTION,
+            "Codex execution infrastructure failed.",
+            RetryDisposition.RETRY,
+        )
+    elif isinstance(error, UnsafeCodexInvocation):
+        fixed = (
+            FailureCategory.CODEX_EXECUTION,
+            FailureCode.UNSAFE_CODEX_INVOCATION,
+            "Codex invocation was unsafe.",
+            RetryDisposition.TERMINAL,
+        )
+    elif isinstance(error, BinaryPatchError):
+        fixed = (
+            FailureCategory.CODEX_EXECUTION,
+            FailureCode.CODEX_EXECUTION,
+            "Codex patch did not satisfy the evaluation contract.",
+            RetryDisposition.RETRY,
+        )
     elif isinstance(error, ReadinessFailure):
-        fixed = FailureCategory.TREATMENT_VALIDATION, error.safe_summary
+        fixed = (
+            FailureCategory.TREATMENT_VALIDATION,
+            FailureCode.READINESS,
+            error.safe_summary,
+            RetryDisposition.RETRY,
+        )
+    elif isinstance(error, PluginInspectionFailure):
+        fixed = (
+            FailureCategory.TREATMENT_VALIDATION,
+            FailureCode.PLUGIN_INSPECTION,
+            error.safe_summary,
+            RetryDisposition.RETRY,
+        )
     elif isinstance(error, InvalidTreatment):
         fixed = (
             FailureCategory.TREATMENT_VALIDATION,
+            FailureCode.INVALID_TREATMENT_CONTRACT,
             _TREATMENT_FAILURE_SUMMARIES.get(str(error), "Treatment validation failed."),
+            RetryDisposition.TERMINAL,
         )
     elif isinstance(error, OfficialResultError):
-        fixed = FailureCategory.OFFICIAL_EVALUATOR, "Official evaluation failed."
+        fixed = (
+            FailureCategory.OFFICIAL_EVALUATOR,
+            FailureCode.OFFICIAL_EVALUATOR,
+            "Official evaluation failed.",
+            RetryDisposition.RETRY,
+        )
     elif isinstance(error, (ReportingError, InvalidReportBundle, ArtifactError)):
-        fixed = FailureCategory.REPORT_GENERATION, _REPORT_SUMMARY
+        fixed = (
+            FailureCategory.REPORT_GENERATION,
+            FailureCode.REPORT_GENERATION,
+            _REPORT_SUMMARY,
+            RetryDisposition.RETRY,
+        )
     elif isinstance(error, (CommandError, PowerContextEvalError)):
-        fixed = _phase_failure(phase)
+        category, summary = _phase_failure(phase)
+        fixed = category, _phase_failure_code(phase), summary, RetryDisposition.RETRY
     else:
-        fixed = FailureCategory.INTERNAL, _INTERNAL_SUMMARY
-    return SafeFailure(category=fixed[0], phase=phase, summary=fixed[1])
+        fixed = FailureCategory.INTERNAL, FailureCode.INTERNAL, _INTERNAL_SUMMARY, RetryDisposition.RETRY
+    return SafeFailure(
+        category=fixed[0],
+        failure_code=fixed[1],
+        phase=phase,
+        summary=fixed[2],
+        retry_disposition=fixed[3],
+    )
 
 
 def _safe_command_failure_fields(error: Exception) -> tuple[str, str]:
@@ -755,4 +883,16 @@ def _phase_failure(phase: TaskPhase | None) -> tuple[FailureCategory, str]:
         TaskPhase.OFFICIAL_EVALUATION: (FailureCategory.OFFICIAL_EVALUATOR, "Official evaluation failed."),
         TaskPhase.GENERATING_REPORT: (FailureCategory.REPORT_GENERATION, _REPORT_SUMMARY),
         None: (FailureCategory.INTERNAL, _INTERNAL_SUMMARY),
+    }[phase]
+
+
+def _phase_failure_code(phase: TaskPhase | None) -> FailureCode:
+    return {
+        TaskPhase.PREPARING: FailureCode.INTERNAL,
+        TaskPhase.VALIDATING_GOLD: FailureCode.GOLD_VALIDATION,
+        TaskPhase.RUNNING_OFF: FailureCode.CODEX_EXECUTION,
+        TaskPhase.RUNNING_ON: FailureCode.CODEX_EXECUTION,
+        TaskPhase.OFFICIAL_EVALUATION: FailureCode.OFFICIAL_EVALUATOR,
+        TaskPhase.GENERATING_REPORT: FailureCode.REPORT_GENERATION,
+        None: FailureCode.INTERNAL,
     }[phase]

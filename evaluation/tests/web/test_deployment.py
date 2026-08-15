@@ -13,7 +13,7 @@ DEPLOY = EVALUATION / "deploy"
 EXPECTED_ENVIRONMENT_KEYS = {
     "POWERCONTEXT_EVAL_AUTH_JSON",
     "POWERCONTEXT_EVAL_CODEX_BINARY",
-    "POWERCONTEXT_EVAL_CODEX_CAPACITY_RETRY_MAX",
+    "POWERCONTEXT_EVAL_MAX_ATTEMPTS",
     "POWERCONTEXT_EVAL_CODEX_MODELS",
     "POWERCONTEXT_EVAL_DATABASE_PATH",
     "POWERCONTEXT_EVAL_DATASET_PATH",
@@ -186,7 +186,7 @@ def test_operator_guide_documents_safety_acceptance_and_rollback_contracts() -> 
         "sqlite3",
         "paired",
         "preview",
-        "manual resume",
+        "pure operator intent",
         "usage unavailable",
         "attempt",
         "boundary",
@@ -206,8 +206,8 @@ def test_operator_guide_documents_configurable_task_pair_parallelism() -> None:
         "POWERCONTEXT_EVAL_TASK_PARALLELISM",
         "defaults to `1`",
         "twenty concurrent task pairs",
-        "stop new claims",
-        "active task pairs finish",
+        "transient claim-admission gates",
+        "one task failure never pauses healthy peers",
         "infrastructure failure",
         "active_task_pairs",
         "task_parallelism",
@@ -215,6 +215,24 @@ def test_operator_guide_documents_configurable_task_pair_parallelism() -> None:
 
     assert all(term.lower() in guide.lower() for term in required)
     assert "exactly one physical OFF/ON task pair running globally" not in guide
+
+
+def test_operator_guide_documents_self_progressing_retry_and_release_contract() -> None:
+    guide = (EVALUATION / "README.md").read_text().lower()
+    required = {
+        "only an operator pause or cancel changes durable batch control intent",
+        "at most five total attempts",
+        "30, 120, 300, and 600 second backoffs",
+        "private-incidents",
+        "exact attempt-owned containers, network, and scratch workspace",
+        "never steals an expired lease",
+        "deployment_consistent: true",
+        "web_revision",
+        "worker_revision",
+        "reopen automatically",
+    }
+
+    assert all(term in guide for term in required)
 
 
 def test_operator_guide_documents_tokensflow_zero_loss_operation_and_recovery() -> None:
