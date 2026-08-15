@@ -51,6 +51,9 @@ from powercontext_eval.web.models import (
 from powercontext_eval.web.usage import UsageSnapshot
 
 _RETRY_BACKOFF_SECONDS = (30, 120, 300, 600)
+# Some Gold suites contain wall-clock tests with a deterministic two-hour bad window.
+# Keep the bounded final attempt until that window has rolled over instead of burning it immediately.
+_GOLD_VALIDATION_RETRY_BACKOFF_SECONDS = (30, 120, 300, 7_200)
 
 
 class TaskStoreError(RuntimeError):
@@ -2172,7 +2175,11 @@ class TaskStore:
                 actor="system",
                 details={"reason": str(attempt["failure_code"] or FailureCode.INTERNAL.value)},
                 now=now,
-                eligible_at=now + _retry_backoff(int(attempt["attempt_number"])),
+                eligible_at=now
+                + _retry_backoff(
+                    int(attempt["attempt_number"]),
+                    failure_code=str(attempt["failure_code"]) if attempt["failure_code"] is not None else None,
+                ),
             )
             return True
 
@@ -2763,13 +2770,18 @@ def _timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _retry_backoff(failed_attempt_number: int) -> timedelta:
+def _retry_backoff(failed_attempt_number: int, *, failure_code: str | None) -> timedelta:
     """Return the bounded persisted delay before the next automatic attempt."""
 
     if failed_attempt_number < 1:
         raise ValueError("failed attempt number must be positive")
-    index = min(failed_attempt_number - 1, len(_RETRY_BACKOFF_SECONDS) - 1)
-    return timedelta(seconds=_RETRY_BACKOFF_SECONDS[index])
+    schedule = (
+        _GOLD_VALIDATION_RETRY_BACKOFF_SECONDS
+        if failure_code == FailureCode.GOLD_VALIDATION.value
+        else _RETRY_BACKOFF_SECONDS
+    )
+    index = min(failed_attempt_number - 1, len(schedule) - 1)
+    return timedelta(seconds=schedule[index])
 
 
 def _legacy_failure_code(category: FailureCategory | None) -> FailureCode:

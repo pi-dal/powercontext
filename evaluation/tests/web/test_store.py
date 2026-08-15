@@ -1257,6 +1257,42 @@ def test_cleanup_preserves_failed_attempt_and_idempotently_creates_attempt_two(s
     )
 
 
+def test_gold_validation_retries_span_long_time_dependent_failure_windows(store: TaskStore) -> None:
+    batch = store.create_batch(
+        batch_request("gold-retry-window"),
+        ("instance_owner__repo-a",),
+        now=NOW,
+    )[0]
+    task = store.list_batch_tasks(batch.batch_id)[0]
+    eligible_at = NOW
+
+    for attempt_number, backoff_seconds in enumerate((30, 120, 300, 7_200), start=1):
+        worker_id = f"gold-worker-{attempt_number}"
+        claimed = store.claim_next(worker_id, now=eligible_at)
+        assert claimed is not None
+        assert claimed.task_id == task.task_id
+        assert claimed.attempt_number == attempt_number
+        failed_at = eligible_at + timedelta(seconds=1)
+        store.fail(
+            task.task_id,
+            worker_id,
+            SafeFailure(
+                category=FailureCategory.GOLD_VALIDATION,
+                failure_code=FailureCode.GOLD_VALIDATION,
+                phase=TaskPhase.VALIDATING_GOLD,
+                summary="Gold patch validation failed",
+            ),
+            now=failed_at,
+        )
+        cleanup_at = failed_at + timedelta(seconds=1)
+
+        assert complete_attempt_cleanup(store, task.task_id, now=cleanup_at) is True
+        retry = store.get_batch_task(batch.batch_id, task.task_id)
+        assert retry.attempt_number == attempt_number + 1
+        assert retry.eligible_at == cleanup_at + timedelta(seconds=backoff_seconds)
+        eligible_at = retry.eligible_at
+
+
 def test_retry_in_a_paused_batch_preserves_pause_control(store: TaskStore) -> None:
     batch = store.create_batch(
         batch_request("attempt-retry-paused"),
