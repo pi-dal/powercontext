@@ -414,7 +414,6 @@ class TaskStore:
                 connection.execute("ALTER TABLE task_attempts ADD COLUMN cleanup_error_code TEXT")
             connection.execute("UPDATE task_attempts SET eligible_at = created_at WHERE eligible_at IS NULL")
             connection.execute("UPDATE batches SET control_updated_at = created_at WHERE control_updated_at IS NULL")
-            self._resume_legacy_system_pauses(connection)
             _migrate_worker_runtime_parallelism_constraint(connection)
             _backfill_legacy_batch_requests(connection)
             _backfill_legacy_task_requests(connection)
@@ -1333,52 +1332,6 @@ class TaskStore:
 
         snapshot = self.deployment_snapshot()
         return snapshot["deployment_consistent"]
-
-    @staticmethod
-    def _resume_legacy_system_pauses(connection: sqlite3.Connection) -> None:
-        """Migrate obsolete system-owned pauses back to transient admission."""
-
-        system_reasons = tuple(reason.value for reason in BatchPauseReason if reason is not BatchPauseReason.USER)
-        placeholders = ",".join("?" for _ in system_reasons)
-        rows = connection.execute(
-            f"""
-            SELECT batch_id, control_updated_at
-            FROM batches
-            WHERE control_intent = ?
-              AND pause_reason IN ({placeholders})
-              AND EXISTS (
-                  SELECT 1 FROM tasks
-                  WHERE tasks.batch_id = batches.batch_id
-                    AND tasks.status IN (?, ?)
-              )
-            ORDER BY batch_seq
-            """,
-            (
-                BatchControlIntent.PAUSE.value,
-                *system_reasons,
-                TaskStatus.QUEUED.value,
-                TaskStatus.RUNNING.value,
-            ),
-        ).fetchall()
-        for row in rows:
-            batch_id = str(row["batch_id"])
-            occurred_at = _parse_timestamp(str(row["control_updated_at"]))
-            connection.execute(
-                """
-                UPDATE batches
-                SET control_intent = ?, pause_reason = NULL, control_version = control_version + 1
-                WHERE batch_id = ?
-                """,
-                (BatchControlIntent.RUN.value, batch_id),
-            )
-            TaskStore._append_control_event(
-                connection,
-                batch_id,
-                BatchControlEventType.RESUMED,
-                "system",
-                {"reason": "legacy_system_pause_migrated"},
-                occurred_at,
-            )
 
     def register_tokensflow_finalization(
         self,

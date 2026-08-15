@@ -1682,7 +1682,7 @@ def test_runtime_revision_gate_reopens_only_for_matching_web_and_worker(store: T
     assert store.deployment_admission_open() is True
 
 
-def test_initialize_migrates_only_legacy_system_pauses(database: Path) -> None:
+def test_initialize_preserves_all_legacy_pause_intents(database: Path) -> None:
     store = TaskStore(database, lease_duration=timedelta(seconds=60))
     store.initialize()
     system_batch = store.create_batch(
@@ -1701,16 +1701,19 @@ def test_initialize_migrates_only_legacy_system_pauses(database: Path) -> None:
             "UPDATE batches SET control_intent = ?, pause_reason = ? WHERE batch_id = ?",
             (BatchControlIntent.PAUSE.value, BatchPauseReason.INFRASTRUCTURE_FAILURE.value, system_batch.batch_id),
         )
+    system_events = store.list_control_events(system_batch.batch_id)
+    user_events = store.list_control_events(user_batch.batch_id)
 
     store.initialize()
 
-    migrated = store.get_batch(system_batch.batch_id)
-    preserved = store.get_batch(user_batch.batch_id)
-    assert migrated.control.intent is BatchControlIntent.RUN
-    assert migrated.control.pause_reason is None
-    assert preserved.control.intent is BatchControlIntent.PAUSE
-    assert preserved.control.pause_reason is BatchPauseReason.USER
-    assert store.list_control_events(system_batch.batch_id)[-1].details == {"reason": "legacy_system_pause_migrated"}
+    preserved_system = store.get_batch(system_batch.batch_id)
+    preserved_user = store.get_batch(user_batch.batch_id)
+    assert preserved_system.control.intent is BatchControlIntent.PAUSE
+    assert preserved_system.control.pause_reason is BatchPauseReason.INFRASTRUCTURE_FAILURE
+    assert preserved_user.control.intent is BatchControlIntent.PAUSE
+    assert preserved_user.control.pause_reason is BatchPauseReason.USER
+    assert store.list_control_events(system_batch.batch_id) == system_events
+    assert store.list_control_events(user_batch.batch_id) == user_events
 
 
 @pytest.mark.parametrize("value", [0, 21, True])
