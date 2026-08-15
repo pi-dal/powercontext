@@ -357,6 +357,39 @@ def test_attempt_cleaner_exports_private_spool_then_reclaims_and_schedules_retry
     assert any(call[1:3] == ("network", "ls") for call in runner.calls)
 
 
+def test_attempt_cleaner_does_not_require_chmod_follow_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store = _store(tmp_path)
+    batch_id, task_id = _fail(store, "no-chmod-follow-symlinks")
+    workspace = config.run_root / "work" / task_id
+    tokensflow_home = workspace / "off" / "runtime" / "tokensflow-home"
+    tokensflow_home.mkdir(parents=True)
+    (tokensflow_home / "queue.db").write_bytes(b"private diagnostic state")
+
+    def unsupported_chmod(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise NotImplementedError("chmod: follow_symlinks unavailable on this platform")
+
+    monkeypatch.setattr(os, "chmod", unsupported_chmod)
+    cleaner = AttemptLifecycleCleaner(
+        store,
+        config.run_root,
+        runner=EmptyDockerRunner(),
+        clock=lambda: NOW + timedelta(seconds=3),
+    )
+
+    assert cleaner.run_once() == 1
+    private = config.run_root / "private-incidents" / task_id / "tokensflow-spool.tar.gz"
+    assert stat.S_IMODE(private.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(private.stat().st_mode) == 0o600
+    assert [attempt.status for attempt in store.list_task_attempts(batch_id, task_id)] == [
+        TaskStatus.FAILED,
+        TaskStatus.QUEUED,
+    ]
+
+
 def test_attempt_cleaner_retries_cleanup_without_creating_an_early_attempt(tmp_path: Path) -> None:
     config, store = _store(tmp_path)
     batch_id, task_id = _fail(store, "deferred")

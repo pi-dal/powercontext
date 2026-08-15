@@ -28,6 +28,30 @@ _LOGGER = logging.getLogger(__name__)
 _ATTEMPT_CLEANUP_RETRY_SECONDS = 30
 
 
+def _chmod_nofollow(path: Path, mode: int, *, directory: bool) -> None:
+    """Apply exact permissions through a no-follow file descriptor."""
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise OSError("Platform does not support no-follow incident permissions")
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    if directory:
+        flags |= os.O_DIRECTORY
+    else:
+        flags |= getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        expected_type = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
+        if not expected_type:
+            raise OSError("Private incident path has an unexpected type")
+        os.fchmod(descriptor, mode)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != mode:
+            raise OSError("Private incident permissions did not converge")
+    finally:
+        os.close(descriptor)
+
+
 class ResourceUnavailable(RuntimeError):
     """The filesystem resource state cannot be observed safely."""
 
@@ -313,10 +337,10 @@ class AttemptLifecycleCleaner:
     def _export_private_incident(self, candidate: AttemptCleanupCandidate) -> None:
         private_root = self._run_root / "private-incidents"
         private_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(private_root, 0o700, follow_symlinks=False)
+        _chmod_nofollow(private_root, 0o700, directory=True)
         incident_root = private_root / candidate.run_id
         incident_root.mkdir(mode=0o700, exist_ok=True)
-        os.chmod(incident_root, 0o700, follow_symlinks=False)
+        _chmod_nofollow(incident_root, 0o700, directory=True)
         for path in (private_root, incident_root):
             metadata = path.lstat()
             if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
@@ -330,7 +354,7 @@ class AttemptLifecycleCleaner:
         if metadata is not None:
             if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise OSError("private incident archive is unsafe")
-            os.chmod(target, 0o600, follow_symlinks=False)
+            _chmod_nofollow(target, 0o600, directory=False)
             return
 
         workspace = self._run_root / "work" / candidate.run_id
@@ -354,7 +378,7 @@ class AttemptLifecycleCleaner:
                             recursive=True,
                             filter=retain_regular_entries,
                         )
-            os.chmod(temporary, 0o600, follow_symlinks=False)
+            _chmod_nofollow(temporary, 0o600, directory=False)
             os.replace(temporary, target)
             directory_fd = os.open(incident_root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
             try:
