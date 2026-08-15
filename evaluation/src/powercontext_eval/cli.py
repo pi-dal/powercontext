@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import FrameType
-from typing import TYPE_CHECKING, Annotated, Any, Protocol
+from typing import TYPE_CHECKING, Annotated, Any, Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -18,7 +18,7 @@ from urllib.request import Request, urlopen
 import typer
 from pydantic import ValidationError
 
-from powercontext_eval.benchmarks.swebench_pro.catalog import SweBenchProCatalog
+from powercontext_eval.benchmarks.swebench_pro.catalog import PUBLIC_V2_TASK_SET, SweBenchProCatalog, TaskSet
 from powercontext_eval.codex import DEFAULT_CODEX_MODEL, DEFAULT_REASONING_EFFORT
 from powercontext_eval.powercontext_sut import run_codex_contract_smoke
 from powercontext_eval.runner import RunConfig, run_swebench_pro_instance
@@ -216,6 +216,7 @@ def swebench_pro_create_batch(
     idempotency_key: str = typer.Option(..., "--idempotency-key"),
     console_url: str = typer.Option("http://127.0.0.1:8787", "--console-url"),
     powercontext_ref: str = typer.Option("latest", "--powercontext-ref"),
+    task_set: str = typer.Option(PUBLIC_V2_TASK_SET, "--task-set"),
     model: str = typer.Option(DEFAULT_CODEX_MODEL, "--model"),
     usage_pause_percent: int = typer.Option(80, "--usage-pause-percent", min=1, max=100),
     start_paused: bool = typer.Option(False, "--start-paused/--start-running"),
@@ -227,7 +228,7 @@ def swebench_pro_create_batch(
         batch = BatchCreate(
             powercontext_ref=powercontext_ref,
             benchmark="swebench-pro",
-            task_set="swebench-pro-public-v2",
+            task_set=cast(TaskSet, task_set),
             model=model,
             reasoning_effort=DEFAULT_REASONING_EFFORT,
             treatment_mode="off_on",

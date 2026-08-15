@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from powercontext_eval.benchmarks.swebench_pro.catalog import TaskSet
 from powercontext_eval.codex import DEFAULT_CODEX_MODEL, DEFAULT_REASONING_EFFORT, is_safe_codex_model
 from powercontext_eval.models import PowerContextRef
 from powercontext_eval.web.controls import BatchControlState
@@ -23,7 +24,7 @@ class _FrozenModel(BaseModel):
 class BatchCreate(_FrozenModel):
     powercontext_ref: str
     benchmark: Literal["swebench-pro"]
-    task_set: Literal["swebench-pro-public-v2"]
+    task_set: TaskSet
     model: str = DEFAULT_CODEX_MODEL
     reasoning_effort: Literal["medium"] = DEFAULT_REASONING_EFFORT
     treatment_mode: Literal["off_on"]
@@ -51,7 +52,7 @@ class BatchCreate(_FrozenModel):
 class BatchPreviewResponse(_FrozenModel):
     powercontext_ref: str
     benchmark: Literal["swebench-pro"]
-    task_set: Literal["swebench-pro-public-v2"]
+    task_set: TaskSet
     model: str
     reasoning_effort: Literal["medium"]
     treatment_mode: Literal["off_on"]

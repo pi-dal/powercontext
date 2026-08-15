@@ -373,6 +373,18 @@ def test_batch_create_pins_the_public_v2_task_set() -> None:
     ]
 
 
+def test_batch_create_accepts_the_pinned_stability_task_set() -> None:
+    request = BatchCreate(
+        powercontext_ref="latest",
+        benchmark="swebench-pro",
+        task_set="swebench-pro-stability-v1",
+        treatment_mode="off_on",
+        idempotency_key="stability-request",
+    )
+
+    assert request.task_set == "swebench-pro-stability-v1"
+
+
 def test_batch_model_defaults_to_sol_and_accepts_luna_without_an_allowlist() -> None:
     base = {
         "powercontext_ref": "latest",

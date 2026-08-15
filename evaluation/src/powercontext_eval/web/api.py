@@ -20,7 +20,11 @@ from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
-from powercontext_eval.benchmarks.swebench_pro.catalog import CatalogError, SweBenchProCatalog
+from powercontext_eval.benchmarks.swebench_pro.catalog import (
+    CatalogError,
+    SweBenchProCatalog,
+    instance_ids_for_task_set,
+)
 from powercontext_eval.codex import DEFAULT_REASONING_EFFORT
 from powercontext_eval.errors import GitSourceError
 from powercontext_eval.git_source import GitSource
@@ -368,7 +372,7 @@ def create_app(
             candidate = batch.request
             if (
                 candidate.benchmark != "swebench-pro"
-                or candidate.task_set != "swebench-pro-public-v2"
+                or candidate.task_set != request.task_set
                 or candidate.model != request.model
                 or candidate.reasoning_effort != DEFAULT_REASONING_EFFORT
                 or candidate.treatment_mode != "off_on"
@@ -470,14 +474,14 @@ def create_app(
         if snapshot is None:
             return _error(503, "usage_unavailable", "Current Codex subscription usage is unavailable.")
         try:
-            total_tasks = len(get_catalog().instance_ids)
+            total_tasks = len(instance_ids_for_task_set(get_catalog().instance_ids, request.task_set))
         except CatalogError:
             return _error(503, "benchmark_unavailable", "The pinned benchmark task set is unavailable.")
         blocked = snapshot.rate_limit_reached_type is not None or snapshot.used_percent >= request.usage_pause_percent
         response = BatchPreviewResponse(
             powercontext_ref=request.powercontext_ref,
             benchmark="swebench-pro",
-            task_set="swebench-pro-public-v2",
+            task_set=request.task_set,
             model=request.model,
             reasoning_effort=DEFAULT_REASONING_EFFORT,
             treatment_mode="off_on",
@@ -509,10 +513,11 @@ def create_app(
             )
         try:
             selected_catalog = get_catalog()
+            selected_instance_ids = instance_ids_for_task_set(selected_catalog.instance_ids, request.task_set)
             resolved_powercontext_sha = resolve_powercontext_ref(request.powercontext_ref)
             record, created = task_store.create_batch(
                 request,
-                selected_catalog.instance_ids,
+                selected_instance_ids,
                 resolved_powercontext_sha=resolved_powercontext_sha,
                 now=datetime.now(UTC),
                 admit_model=config.accepts_codex_model,

@@ -330,10 +330,12 @@ export type PairCategory =
   | "both_fail"
   | "execution_failure";
 
+export type BatchTaskSet = "swebench-pro-public-v2" | "swebench-pro-stability-v1";
+
 export interface BatchCreate {
   powercontext_ref: string;
   benchmark: "swebench-pro";
-  task_set: "swebench-pro-public-v2";
+  task_set: BatchTaskSet;
   model: string;
   reasoning_effort: "medium";
   treatment_mode: "off_on";
@@ -358,7 +360,7 @@ export interface BatchRecord {
 export interface BatchPreview {
   powercontext_ref: string;
   benchmark: "swebench-pro";
-  task_set: "swebench-pro-public-v2";
+  task_set: BatchTaskSet;
   model: string;
   reasoning_effort: "medium";
   treatment_mode: "off_on";

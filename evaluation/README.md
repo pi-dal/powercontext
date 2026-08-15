@@ -7,9 +7,15 @@ local proxy services.
 
 ## Fixed batch contract
 
-One report is one immutable `swebench-pro-public-v2` batch:
+One report is one immutable pinned task-set batch. The supported task sets are:
 
-- exactly 731 public SWE-bench Pro tasks;
+- `swebench-pro-public-v2`: all 731 public SWE-bench Pro tasks;
+- `swebench-pro-stability-v1`: 24 exact public-v2 instances, ordered as one saturated 20-pair wave followed by four
+  queued replacements. It covers every repository, all four OFF/ON result categories, the source-101 readiness
+  regression, and the previously observed evaluator compatibility boundaries.
+
+Both contracts retain:
+
 - one PowerContext revision resolved to one full commit SHA for the complete batch;
 - one `gpt-5.6-sol` / `medium` Codex configuration;
 - one OFF and one ON execution for every task;
@@ -20,8 +26,9 @@ The pinned dataset SHA-256 is
 `b5b2462bfbf5aeb2cb7ba7d215778a1768b85f9d7ad7f748546c7f80a0ad1510`. The catalog refuses to start if the
 file hash, row count, row schema, task IDs, or source order differs.
 
-The production 731-task batch is long-running and consumes the account's subscription allowance. Do not start it
-during deployment or smoke testing.
+The production 731-task batch is long-running and consumes the account's subscription allowance. Use
+`swebench-pro-stability-v1` for bounded deployment regression testing. Do not start the full set during deployment
+or smoke testing.
 Before a real run, record and show the user:
 
 ```text
@@ -71,8 +78,8 @@ failure items. Do not resume other queued work until those retries succeed and a
 
 ## Subscription usage and batch controls
 
-The launcher first creates a preview. Preview reads the current sanitized account usage and fixed 731-task contract,
-but creates no batch, queue row, attempt, or model call. Only **Confirm and start** persists work.
+The launcher first creates a preview. Preview reads the current sanitized account usage and selected fixed task-set
+contract, but creates no batch, queue row, attempt, or model call. Only **Confirm and start** persists work.
 
 The deployment defaults are:
 
@@ -188,6 +195,28 @@ The pinned Open Library instance ending in `v29f82c9cf21d57b242f8d8b0e541525d259
 `PASS_TO_PASS` node IDs parameterized from `datetime.now().year`. Its derived evaluator input advances only those
 two year values to the evaluation year and following year so they still identify the tests collected in the task
 container. The retained `instance.jsonl` remains value-equivalent to the verified catalog row.
+
+### Timeout policy
+
+Timeouts bound one owned operation; they are not a substitute for the batch pause and retained-evidence contract.
+Keep the budgets aligned with the expected work instead of increasing every limit after one overloaded-host event:
+
+| Operation | Budget | Policy |
+| --- | ---: | --- |
+| Proxy relay socket readiness | 5 seconds | Keep short: this is a local bind with no network or package work. |
+| Local Git and ordinary Docker control commands | 30-60 seconds | Keep bounded; Docker admission waiting is outside the child-process timeout. |
+| PowerContext Server readiness | 120 seconds total, 10 seconds per probe | Probe only `/health/ready`; Codex and plugin checks have separate gates. Retain `powercontext/readiness.json` with fixed, non-sensitive outcomes. |
+| Isolated Codex plugin inspection | 120 seconds total, 60 seconds per attempt | Retry transient command timeouts and incomplete snapshots, then fail closed. |
+| Dependency prewarm | 900 seconds per environment | Covers frozen `uv sync` and image extraction under the shared Docker budget. |
+| Codex inference | 3,600 seconds | Preserve the explicit model-execution ceiling; a timeout remains a retained infrastructure failure. |
+| Official SWE-bench Pro harness | 4,200 seconds | Allows the pinned task test suite to finish while still bounding a stuck harness. |
+| Immediate TokensFlow drain | 60 seconds shared | Applies only to the synchronous fallback; Web batches hand off to the durable finalizer. |
+| Durable TokensFlow finalization | 600 seconds by default | Includes quiesce, upload, doctor, and cleanup with persisted leases and retries. |
+| Codex usage probe | 15 seconds per sample | Keep the probe responsive; transient failures use the last fresh snapshot and do not justify a longer task timeout. |
+
+The Server readiness gate must not call the composite `powercontext doctor`: that command also invokes
+`codex plugin list`, whose own timeout can exceed a readiness probe attempt. A nested longer timeout inside a shorter
+one can turn a healthy Server into a false treatment failure under a 20-task wave.
 
 ## Install configuration and units
 

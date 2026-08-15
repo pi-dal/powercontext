@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -84,6 +85,34 @@ _CONTAINER_UV_PYTHON_INSTALL_DIR = "/runtime/uv-python"
 _DEFAULT_RECORDER_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "record_codex_jsonl.py"
 _TIMED_OUT_CONTAINER_REMOVAL_SETTLE_SECONDS = 90.0
 _TIMED_OUT_CONTAINER_REMOVAL_POLL_SECONDS = 0.25
+_READINESS_BUDGET_SECONDS = 120.0
+_READINESS_ATTEMPT_TIMEOUT_SECONDS = 10.0
+_READINESS_RETRY_SECONDS = 0.5
+_PLUGIN_LIST_BUDGET_SECONDS = 120.0
+_PLUGIN_LIST_ATTEMPT_TIMEOUT_SECONDS = 60.0
+_PLUGIN_LIST_RETRY_SECONDS = 0.5
+_SERVER_READINESS_PROBE_SCRIPT = """
+import json
+import sys
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+request = Request("http://127.0.0.1:8000/health/ready", headers={"Accept": "application/json"})
+code = 0
+payload = None
+try:
+    with urlopen(request, timeout=3) as response:
+        payload = json.load(response)
+except HTTPError as error:
+    code = 10 if error.code == 503 else 12
+except json.JSONDecodeError:
+    code = 11
+except (OSError, ValueError):
+    code = 10
+if code == 0 and (not isinstance(payload, dict) or payload.get("status") != "ready"):
+    code = 11
+sys.exit(code)
+""".strip()
 LOOPBACK_NO_PROXY = "127.0.0.1,localhost,::1,work.oceanbase-dev.com"
 _TOKENSFLOW_RETRY_ATTEMPTS = 10
 _PLUGIN_RELATIVE = Path("integrations/codex/plugins/powercontext")
@@ -101,6 +130,41 @@ exec "$real" "$@"
 
 class InvalidTreatment(PowerContextEvalError):
     """Observed evidence does not prove the requested treatment."""
+
+
+class ReadinessFailureReason(StrEnum):
+    """Fixed, non-sensitive reasons why the isolated Server readiness gate failed."""
+
+    COMMAND_TIMED_OUT = "command_timed_out"
+    SERVER_NOT_READY = "server_not_ready"
+    MALFORMED_RESPONSE = "malformed_response"
+    PROBE_FAILED = "probe_failed"
+
+
+_READINESS_FAILURE_SUMMARIES = MappingProxyType(
+    {
+        ReadinessFailureReason.COMMAND_TIMED_OUT: "PowerContext readiness probe timed out.",
+        ReadinessFailureReason.SERVER_NOT_READY: "PowerContext Server remained not ready before the deadline.",
+        ReadinessFailureReason.MALFORMED_RESPONSE: "PowerContext Server returned malformed readiness evidence.",
+        ReadinessFailureReason.PROBE_FAILED: "PowerContext readiness probe failed.",
+    }
+)
+
+
+class ReadinessFailure(InvalidTreatment):
+    """A safe, classified failure from the isolated Server readiness gate."""
+
+    def __init__(self, reason: ReadinessFailureReason) -> None:
+        if not isinstance(reason, ReadinessFailureReason):
+            raise TypeError("Readiness failure reason must be classified")
+        self.reason = reason
+        super().__init__(_READINESS_FAILURE_SUMMARIES[reason])
+
+    @property
+    def safe_summary(self) -> str:
+        """Return the fixed user-visible failure summary."""
+
+        return _READINESS_FAILURE_SUMMARIES[self.reason]
 
 
 class UnsafeSutConfiguration(PowerContextEvalError):
@@ -897,7 +961,7 @@ class DockerSut:
             )
             container_started = True
             self._verify_codex_version(container, paths, store)
-            self._readiness(container, paths)
+            self._readiness(container, paths, store)
             plugin = self._plugin_list(container, paths)
             self._attach_tokensflow_egress(config, container, paths)
             tokensflow_egress_attached = True
@@ -2258,27 +2322,71 @@ class DockerSut:
                 secrets=tokensflow_command_secrets,
             )
 
-    def _readiness(self, container: str, paths: ArmPaths) -> None:
+    def _readiness(self, container: str, paths: ArmPaths, store: ArtifactStore) -> None:
+        # Probe only the Server readiness contract here.  `powercontext doctor`
+        # also shells out to `codex plugin list` with its own 120-second timeout;
+        # wrapping that composite command in a 10-second process timeout caused
+        # healthy Servers to be misclassified during a full 20-task wave.  Codex
+        # and plugin invariants have dedicated gates immediately before and after
+        # this one, so repeating them here adds latency without adding evidence.
         command = (
             "docker",
             "exec",
             container,
-            "/runtime/pc-env/bin/powercontext",
-            "doctor",
-            "--server-url",
-            "http://127.0.0.1:8000",
-            "--json",
+            "/runtime/pc-env/bin/python",
+            "-c",
+            _SERVER_READINESS_PROBE_SCRIPT,
         )
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + _READINESS_BUDGET_SECONDS
+        attempts = 0
+        timed_out_attempts = 0
+        last_reason = ReadinessFailureReason.PROBE_FAILED
         while time.monotonic() < deadline:
+            attempts += 1
             try:
-                result = self._docker.run(command, cwd=paths.runtime, timeout=10, check=False)
+                result = self._docker.run(
+                    command,
+                    cwd=paths.runtime,
+                    timeout=_READINESS_ATTEMPT_TIMEOUT_SECONDS,
+                    check=False,
+                )
             except CommandTimedOut:
-                continue
-            if result.returncode == 0:
-                return
-            time.sleep(0.5)
-        raise InvalidTreatment("PowerContext Server did not become ready")
+                timed_out_attempts += 1
+                last_reason = ReadinessFailureReason.COMMAND_TIMED_OUT
+            else:
+                if result.returncode == 0:
+                    store.write_json(
+                        "powercontext/readiness.json",
+                        {
+                            "attempts": attempts,
+                            "budget_seconds": _READINESS_BUDGET_SECONDS,
+                            "last_outcome": "ready",
+                            "probe_timeout_seconds": _READINESS_ATTEMPT_TIMEOUT_SECONDS,
+                            "server_ready": True,
+                            "timed_out_attempts": timed_out_attempts,
+                        },
+                    )
+                    return
+                last_reason = {
+                    10: ReadinessFailureReason.SERVER_NOT_READY,
+                    11: ReadinessFailureReason.MALFORMED_RESPONSE,
+                }.get(result.returncode, ReadinessFailureReason.PROBE_FAILED)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(_READINESS_RETRY_SECONDS, remaining))
+        store.write_json(
+            "powercontext/readiness.json",
+            {
+                "attempts": attempts,
+                "budget_seconds": _READINESS_BUDGET_SECONDS,
+                "last_outcome": last_reason.value,
+                "probe_timeout_seconds": _READINESS_ATTEMPT_TIMEOUT_SECONDS,
+                "server_ready": False,
+                "timed_out_attempts": timed_out_attempts,
+            },
+        )
+        raise ReadinessFailure(last_reason)
 
     def _verify_codex_version(self, container: str, paths: ArmPaths, store: ArtifactStore) -> None:
         with docker_pressure.heavy_operation():
@@ -2296,13 +2404,19 @@ class DockerSut:
         )
 
     def _plugin_list(self, container: str, paths: ArmPaths) -> tuple[str, str]:
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + _PLUGIN_LIST_BUDGET_SECONDS
         while True:
-            result = self._docker.run(
-                ("docker", "exec", container, _CONTAINER_CODEX, "plugin", "list", "--json"),
-                cwd=paths.runtime,
-                timeout=30,
-            )
+            try:
+                result = self._docker.run(
+                    ("docker", "exec", container, _CONTAINER_CODEX, "plugin", "list", "--json"),
+                    cwd=paths.runtime,
+                    timeout=_PLUGIN_LIST_ATTEMPT_TIMEOUT_SECONDS,
+                )
+            except CommandTimedOut:
+                if time.monotonic() >= deadline:
+                    raise InvalidTreatment("Isolated Codex plugin inspection timed out") from None
+                time.sleep(_PLUGIN_LIST_RETRY_SECONDS)
+                continue
             try:
                 value = json.loads(result.stdout)
                 if not isinstance(value, dict) or value.get("available") != []:
@@ -2324,7 +2438,7 @@ class DockerSut:
             except (json.JSONDecodeError, KeyError, TypeError):
                 if time.monotonic() >= deadline:
                     raise InvalidTreatment("Isolated Codex home must contain exactly one plugin") from None
-                time.sleep(0.5)
+                time.sleep(_PLUGIN_LIST_RETRY_SECONDS)
                 continue
             return plugin_id, version
 

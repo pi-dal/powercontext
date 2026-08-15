@@ -40,6 +40,8 @@ from powercontext_eval.powercontext_sut import (
     DockerSut,
     InvalidTreatment,
     ProxyRelayConfig,
+    ReadinessFailure,
+    ReadinessFailureReason,
     SocatProxyRelay,
     SutConfig,
     TreatmentEvidence,
@@ -867,10 +869,48 @@ def test_plugin_list_retries_a_transient_invalid_snapshot(tmp_path: Path, monkey
             return command_result(next(self.outputs))
 
     docker = SequencedDocker()
-    monkeypatch.setattr(powercontext_sut.time, "sleep", lambda _: None)
+    monkeypatch.setattr(powercontext_sut.time, "sleep", lambda _seconds: None)
 
-    assert DockerSut(docker)._plugin_list("container", make_paths(tmp_path)) == ("powercontext", "1.0.0")
+    assert DockerSut(docker)._plugin_list("container", make_paths(tmp_path)) == (
+        "powercontext",
+        "1.0.0",
+    )
     assert docker.calls == 2
+
+
+def test_plugin_list_retries_a_transient_command_timeout(tmp_path: Path) -> None:
+    class SequencedDocker:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, argv: tuple[str, ...], **kwargs: object) -> CommandResult:
+            self.calls += 1
+            if self.calls == 1:
+                raise CommandTimedOut("injected plugin timeout", command_result("", returncode=124))
+            return command_result(
+                '{"available": [], "installed": '
+                '[{"pluginId": "powercontext", "version": "1.0.0", "installed": true}]}\n'
+            )
+
+    docker = SequencedDocker()
+
+    assert DockerSut(docker, sleeper=lambda _seconds: None)._plugin_list("container", make_paths(tmp_path)) == (
+        "powercontext",
+        "1.0.0",
+    )
+    assert docker.calls == 2
+
+
+def test_plugin_list_reports_exhausted_command_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class TimedOutDocker:
+        def run(self, argv: tuple[str, ...], **kwargs: object) -> CommandResult:
+            raise CommandTimedOut("injected plugin timeout", command_result("", returncode=124))
+
+    monotonic = iter((0.0, 121.0))
+    monkeypatch.setattr(powercontext_sut.time, "monotonic", lambda: next(monotonic))
+
+    with pytest.raises(InvalidTreatment, match="plugin inspection timed out"):
+        DockerSut(TimedOutDocker())._plugin_list("container", make_paths(tmp_path))
 
 
 def test_plugin_list_fails_closed_after_transient_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -878,7 +918,7 @@ def test_plugin_list_fails_closed_after_transient_budget(tmp_path: Path, monkeyp
         def run(self, argv: tuple[str, ...], **kwargs: object) -> CommandResult:
             return command_result('{"available": [], "installed": []}\n')
 
-    monotonic = iter((0.0, 61.0))
+    monotonic = iter((0.0, 121.0))
     monkeypatch.setattr(powercontext_sut.time, "monotonic", lambda: next(monotonic))
 
     with pytest.raises(InvalidTreatment, match="exactly one plugin"):
@@ -3422,7 +3462,7 @@ def test_transient_readiness_probe_timeout_is_retried(tmp_path: Path) -> None:
         timed_out = False
 
         def run(self, argv: tuple[str, ...], **kwargs: object) -> CommandResult:
-            if not self.timed_out and "/runtime/pc-env/bin/powercontext" in argv and "doctor" in argv:
+            if not self.timed_out and "/runtime/pc-env/bin/python" in argv and "/health/ready" in " ".join(argv):
                 self.commands.append(argv)
                 self.timed_out = True
                 raise CommandTimedOut("injected readiness timeout", command_result("", returncode=124))
@@ -3439,9 +3479,123 @@ def test_transient_readiness_probe_timeout_is_retried(tmp_path: Path) -> None:
     )
 
     readiness_probes = [
-        command for command in docker.commands if "/runtime/pc-env/bin/powercontext" in command and "doctor" in command
+        command
+        for command in docker.commands
+        if "/runtime/pc-env/bin/python" in command and "/health/ready" in " ".join(command)
     ]
     assert len(readiness_probes) == 2
+
+
+def test_readiness_probe_is_server_only_and_persists_safe_audit(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    config = sut_config(tmp_path)
+    config.codex_binary.write_text("binary")
+    config.uv_binary.write_text("binary")
+    docker = TranscriptDocker()
+
+    DockerSut(docker, relay_factory=FakeRelay).run_arm(
+        config,
+        Arm.ON,
+        paths,
+        b"prompt",
+        ArtifactStore(paths.result_root),
+    )
+
+    readiness_probes = [command for command in docker.commands if "/health/ready" in " ".join(command)]
+    assert len(readiness_probes) == 1
+    assert "/runtime/pc-env/bin/python" in readiness_probes[0]
+    assert "doctor" not in readiness_probes[0]
+    compile(powercontext_sut._SERVER_READINESS_PROBE_SCRIPT, "<readiness-probe>", "exec")
+    audit = json.loads((paths.result_root / "powercontext/readiness.json").read_text())
+    assert audit == {
+        "attempts": 1,
+        "budget_seconds": 120.0,
+        "last_outcome": "ready",
+        "probe_timeout_seconds": 10.0,
+        "server_ready": True,
+        "timed_out_attempts": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("returncode", "reason", "summary"),
+    [
+        (
+            10,
+            ReadinessFailureReason.SERVER_NOT_READY,
+            "PowerContext Server remained not ready before the deadline.",
+        ),
+        (
+            11,
+            ReadinessFailureReason.MALFORMED_RESPONSE,
+            "PowerContext Server returned malformed readiness evidence.",
+        ),
+        (12, ReadinessFailureReason.PROBE_FAILED, "PowerContext readiness probe failed."),
+    ],
+)
+def test_readiness_failure_is_classified_and_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    reason: ReadinessFailureReason,
+    summary: str,
+) -> None:
+    class FailingProbeDocker:
+        def run(self, argv: tuple[str, ...], **kwargs: object) -> CommandResult:
+            return command_result("", returncode=returncode)
+
+    now = 0.0
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(powercontext_sut, "_READINESS_BUDGET_SECONDS", 0.5)
+    monkeypatch.setattr(powercontext_sut.time, "monotonic", monotonic)
+    monkeypatch.setattr(powercontext_sut.time, "sleep", sleep)
+    paths = make_paths(tmp_path)
+    store = ArtifactStore(paths.result_root)
+
+    with pytest.raises(ReadinessFailure, match=summary) as captured:
+        DockerSut(FailingProbeDocker())._readiness("container", paths, store)
+
+    assert captured.value.reason is reason
+    audit = json.loads((paths.result_root / "powercontext/readiness.json").read_text())
+    assert audit["last_outcome"] == reason.value
+    assert audit["server_ready"] is False
+
+
+def test_readiness_command_timeout_is_classified_and_persisted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class TimedOutProbeDocker:
+        def run(self, argv: tuple[str, ...], **kwargs: object) -> CommandResult:
+            raise CommandTimedOut("injected readiness timeout", command_result("", returncode=124))
+
+    now = 0.0
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(powercontext_sut, "_READINESS_BUDGET_SECONDS", 0.5)
+    monkeypatch.setattr(powercontext_sut.time, "monotonic", monotonic)
+    monkeypatch.setattr(powercontext_sut.time, "sleep", sleep)
+    paths = make_paths(tmp_path)
+    store = ArtifactStore(paths.result_root)
+
+    with pytest.raises(ReadinessFailure, match="readiness probe timed out") as captured:
+        DockerSut(TimedOutProbeDocker())._readiness("container", paths, store)
+
+    assert captured.value.reason is ReadinessFailureReason.COMMAND_TIMED_OUT
+    audit = json.loads((paths.result_root / "powercontext/readiness.json").read_text())
+    assert audit["last_outcome"] == "command_timed_out"
+    assert audit["server_ready"] is False
+    assert audit["timed_out_attempts"] == 1
 
 
 def test_managed_python_is_kept_in_the_writable_arm_runtime(tmp_path: Path) -> None:

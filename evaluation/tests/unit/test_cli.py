@@ -180,6 +180,8 @@ def test_cli_creates_a_luna_batch_atomically_paused(monkeypatch) -> None:
             "luna-paused-cli",
             "--model",
             "gpt-5.6-luna",
+            "--task-set",
+            "swebench-pro-stability-v1",
             "--start-paused",
         ],
     )
@@ -193,6 +195,7 @@ def test_cli_creates_a_luna_batch_atomically_paused(monkeypatch) -> None:
     assert isinstance(request.data, bytes)
     payload = json.loads(request.data)
     assert payload["model"] == "gpt-5.6-luna"
+    assert payload["task_set"] == "swebench-pro-stability-v1"
     assert payload["initial_control_intent"] == "pause"
 
 

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import type { EvaluationApi } from "../api";
-import type { BatchCreate, BatchPreview, BatchRecord } from "../types";
+import type { BatchCreate, BatchPreview, BatchRecord, BatchTaskSet } from "../types";
 import { formatUsageWindow } from "../usageFormat";
 
 interface BatchLauncherProps {
@@ -33,6 +33,7 @@ function dateTime(value: string): string {
 
 export function BatchLauncher({ api, onCreated }: BatchLauncherProps) {
   const [revision, setRevision] = useState("latest");
+  const [taskSet, setTaskSet] = useState<BatchTaskSet>("swebench-pro-public-v2");
   const [model, setModel] = useState("gpt-5.6-sol");
   const [models, setModels] = useState<string[]>(["gpt-5.6-sol"]);
   const [startPaused, setStartPaused] = useState(false);
@@ -45,6 +46,7 @@ export function BatchLauncher({ api, onCreated }: BatchLauncherProps) {
   const generation = useRef(0);
   const confirmationKey = useRef<{
     revision: string;
+    taskSet: BatchTaskSet;
     model: string;
     threshold: number;
     initialControlIntent: "run" | "pause";
@@ -100,7 +102,7 @@ export function BatchLauncher({ api, onCreated }: BatchLauncherProps) {
     setPending("preview");
     try {
       const result = await api.previewBatch(
-        { powercontext_ref: revision, model, usage_pause_percent: threshold },
+        { powercontext_ref: revision, task_set: taskSet, model, usage_pause_percent: threshold },
         nextController.signal,
       );
       if (nextController.signal.aborted || generation.current !== currentGeneration) return;
@@ -119,12 +121,14 @@ export function BatchLauncher({ api, onCreated }: BatchLauncherProps) {
     if (preview === null || !preview.can_start || pending !== null) return;
     const intent = {
       revision: preview.powercontext_ref,
+      taskSet: preview.task_set,
       model: preview.model,
       threshold: preview.usage_pause_percent,
       initialControlIntent: startPaused ? "pause" as const : "run" as const,
     };
     if (
       confirmationKey.current?.revision !== intent.revision
+      || confirmationKey.current.taskSet !== intent.taskSet
       || confirmationKey.current.model !== intent.model
       || confirmationKey.current.threshold !== intent.threshold
       || confirmationKey.current.initialControlIntent !== intent.initialControlIntent
@@ -171,19 +175,34 @@ export function BatchLauncher({ api, onCreated }: BatchLauncherProps) {
       <div className="panel-heading">
         <div>
           <p className="eyebrow">新批次</p>
-          <h2>运行完整评测</h2>
+          <h2>运行评测批次</h2>
         </div>
         <span className="safe-badge">固定任务集</span>
       </div>
 
       <div className="batch-contract" aria-label="固定评测范围">
-        <strong>SWE-bench Pro public v2</strong>
-        <span>731 个任务，每个任务依次运行 OFF / ON</span>
+        <strong>{taskSet === "swebench-pro-public-v2" ? "SWE-bench Pro public v2" : "稳定性回归 v1"}</strong>
+        <span>{taskSet === "swebench-pro-public-v2" ? "731" : "24"} 个任务，每个任务依次运行 OFF / ON</span>
         <span>{model} · medium</span>
         <span>Worker 按配置并行运行独立任务对</span>
       </div>
 
       <form onSubmit={requestPreview} className="launcher-form">
+        <label>
+          任务集
+          <select
+            aria-label="任务集"
+            value={taskSet}
+            onChange={(event) => {
+              invalidatePreview();
+              setTaskSet(event.target.value as BatchTaskSet);
+            }}
+          >
+            <option value="swebench-pro-public-v2">完整 public v2（731 项）</option>
+            <option value="swebench-pro-stability-v1">稳定性回归 v1（24 项）</option>
+          </select>
+          <span className="field-hint">固定清单；稳定性回归包含 20 路首批和 4 项队列补位</span>
+        </label>
         <label>
           PowerContext 版本
           <input

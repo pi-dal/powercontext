@@ -8,6 +8,7 @@ import type {
   BatchTaskDetail,
   BatchTaskListOptions,
   BatchTaskPage,
+  BatchTaskSet,
   Capabilities,
   ContextEvent,
   ContextEventPage,
@@ -98,6 +99,7 @@ const failureCategorySchema = z.enum([
   "internal",
 ]);
 const codexModelSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+const batchTaskSetSchema = z.enum(["swebench-pro-public-v2", "swebench-pro-stability-v1"]);
 
 const taskCreateSchema = z.strictObject({
   powercontext_ref: z.union([z.literal("latest"), z.string().regex(/^commit:[0-9a-fA-F]{40}$/)]),
@@ -330,7 +332,7 @@ const reportSchema = z.strictObject({
 const batchCreateSchema = z.strictObject({
   powercontext_ref: z.union([z.literal("latest"), z.string().regex(/^commit:[0-9a-fA-F]{40}$/)]),
   benchmark: z.literal("swebench-pro"),
-  task_set: z.literal("swebench-pro-public-v2"),
+  task_set: batchTaskSetSchema,
   model: codexModelSchema,
   reasoning_effort: z.literal("medium"),
   treatment_mode: z.literal("off_on"),
@@ -394,7 +396,7 @@ const batchRecordSchema = z.strictObject({
 const batchPreviewSchema = z.strictObject({
   powercontext_ref: z.union([z.literal("latest"), z.string().regex(/^commit:[0-9a-fA-F]{40}$/)]),
   benchmark: z.literal("swebench-pro"),
-  task_set: z.literal("swebench-pro-public-v2"),
+  task_set: batchTaskSetSchema,
   model: codexModelSchema,
   reasoning_effort: z.literal("medium"),
   treatment_mode: z.literal("off_on"),
@@ -713,7 +715,7 @@ export class EvaluationApi {
   }
 
   previewBatch(
-    request: { powercontext_ref: string; model: string; usage_pause_percent: number },
+    request: { powercontext_ref: string; task_set: BatchTaskSet; model: string; usage_pause_percent: number },
     signal?: AbortSignal,
   ): Promise<BatchPreview> {
     return this.#json(apiPath("/batches/preview"), validateBatchPreview, {

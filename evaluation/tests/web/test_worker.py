@@ -17,7 +17,12 @@ from powercontext_eval.benchmarks.swebench_pro.evaluator import OfficialResultEr
 from powercontext_eval.codex import CodexCapacityError, CodexInfrastructureError
 from powercontext_eval.errors import CommandFailed, GitSourceError
 from powercontext_eval.models import Arm
-from powercontext_eval.powercontext_sut import InvalidTreatment, UnsafeSutConfiguration
+from powercontext_eval.powercontext_sut import (
+    InvalidTreatment,
+    ReadinessFailure,
+    ReadinessFailureReason,
+    UnsafeSutConfiguration,
+)
 from powercontext_eval.process import CommandResult
 from powercontext_eval.runner import MinimalRunConfig, MinimalRunResult, RunConfig, RunPhase
 from powercontext_eval.tokensflow import TokensFlowFinalizationDescriptor, TokensFlowInfrastructureError
@@ -927,6 +932,16 @@ def test_worker_never_repairs_a_symlink_lock_target(tmp_path: Path) -> None:
         ),
         (GoldCheckFailed("secret"), FailureCategory.GOLD_VALIDATION, "Gold patch validation failed."),
         (CodexInfrastructureError("secret"), FailureCategory.CODEX_EXECUTION, "Codex execution failed."),
+        (
+            ReadinessFailure(ReadinessFailureReason.COMMAND_TIMED_OUT),
+            FailureCategory.TREATMENT_VALIDATION,
+            "PowerContext readiness probe timed out.",
+        ),
+        (
+            InvalidTreatment("Isolated Codex plugin inspection timed out"),
+            FailureCategory.TREATMENT_VALIDATION,
+            "Isolated Codex plugin inspection timed out.",
+        ),
         (InvalidTreatment("secret"), FailureCategory.TREATMENT_VALIDATION, "Treatment validation failed."),
         (OfficialResultError("secret"), FailureCategory.OFFICIAL_EVALUATOR, "Official evaluation failed."),
     ],

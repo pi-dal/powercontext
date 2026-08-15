@@ -26,7 +26,7 @@ from powercontext_eval.errors import CommandError, GitSourceError, PowerContextE
 from powercontext_eval.git_source import GitSource
 from powercontext_eval.models import PowerContextRef
 from powercontext_eval.paths import EvaluationPaths
-from powercontext_eval.powercontext_sut import InvalidTreatment, UnsafeSutConfiguration
+from powercontext_eval.powercontext_sut import InvalidTreatment, ReadinessFailure, UnsafeSutConfiguration
 from powercontext_eval.process import ProcessRunner
 from powercontext_eval.report import InvalidReportBundle
 from powercontext_eval.runner import (
@@ -55,6 +55,29 @@ from powercontext_eval.web.usage import CodexUsageProbe, UsageSnapshot
 
 _INTERNAL_SUMMARY = "The evaluation worker failed unexpectedly. Inspect the retained m0 logs."
 _REPORT_SUMMARY = "Evaluation report validation failed."
+_TREATMENT_FAILURE_SUMMARIES = {
+    "Treatment evidence is malformed": "Treatment evidence was malformed.",
+    "Treatment evidence does not match the requested arm": "Treatment evidence did not match the requested arm.",
+    "PowerContext source HEAD does not match the configured commit": (
+        "PowerContext source revision did not match the pinned batch."
+    ),
+    "PowerContext source checkout must be clean": "PowerContext source checkout was not clean.",
+    "PowerContext plugin manifest is invalid": "PowerContext plugin manifest was invalid.",
+    "PowerContext plugin manifest version does not match configuration": (
+        "PowerContext plugin manifest version did not match the evaluation configuration."
+    ),
+    "PowerContext plugin lockfile is missing": "PowerContext plugin lockfile was missing.",
+    "PowerContext plugin lockfile is invalid": "PowerContext plugin lockfile was invalid.",
+    "Isolated Codex home does not contain the exact expected plugin": (
+        "Isolated Codex home did not contain the pinned PowerContext plugin."
+    ),
+    "Codex CLI version does not match the pinned experiment": (
+        "Codex CLI version did not match the pinned experiment."
+    ),
+    "Isolated Codex plugin inspection timed out": "Isolated Codex plugin inspection timed out.",
+    "Isolated Codex home must contain exactly one plugin": "Isolated Codex home did not converge to one plugin.",
+    "PowerContext SQLite evidence is malformed": "PowerContext SQLite treatment evidence was malformed.",
+}
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -690,8 +713,13 @@ def _safe_failure(error: Exception, phase: TaskPhase | None, *, auto_retry_allow
         fixed = FailureCategory.GOLD_VALIDATION, "Gold patch validation failed."
     elif isinstance(error, (CodexInfrastructureError, UnsafeCodexInvocation, BinaryPatchError)):
         fixed = FailureCategory.CODEX_EXECUTION, "Codex execution failed."
+    elif isinstance(error, ReadinessFailure):
+        fixed = FailureCategory.TREATMENT_VALIDATION, error.safe_summary
     elif isinstance(error, InvalidTreatment):
-        fixed = FailureCategory.TREATMENT_VALIDATION, "Treatment validation failed."
+        fixed = (
+            FailureCategory.TREATMENT_VALIDATION,
+            _TREATMENT_FAILURE_SUMMARIES.get(str(error), "Treatment validation failed."),
+        )
     elif isinstance(error, OfficialResultError):
         fixed = FailureCategory.OFFICIAL_EVALUATOR, "Official evaluation failed."
     elif isinstance(error, (ReportingError, InvalidReportBundle, ArtifactError)):

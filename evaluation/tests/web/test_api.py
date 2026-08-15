@@ -15,6 +15,7 @@ from starlette.requests import Request
 
 from powercontext_eval.artifacts import ArmState
 from powercontext_eval.benchmarks.swebench_pro.adapter import SweBenchProInstance
+from powercontext_eval.benchmarks.swebench_pro.catalog import STABILITY_V1_CASES, STABILITY_V1_TASK_SET
 from powercontext_eval.benchmarks.swebench_pro.gold_overrides import (
     SOURCE559_DATASET_PATCH_SHA256,
     SOURCE559_INSTANCE_ID,
@@ -1029,18 +1030,18 @@ class _BatchCatalog:
     def __init__(self, instance_ids: tuple[str, ...] | None = None) -> None:
         if instance_ids is not None:
             self.instance_ids = instance_ids
-        labels = "abcde"[: len(self.instance_ids)]
+        labels = tuple("abcde"[index] if index < 5 else str(index) for index in range(len(self.instance_ids)))
         self.instances = {
             instance_id: SimpleNamespace(
                 instance_id=instance_id,
-                repo=f"org/repo-{letter}",
-                problem_statement=f"Fix the complete problem for repository {letter}.",
-                fail_to_pass=(f"test_fix_{letter}",),
-                pass_to_pass=(f"test_regression_{letter}",),
-                test_patch=f"diff --git a/test_{letter}.py b/test_{letter}.py\n",
-                selected_test_files_to_run=json.dumps([f"test_{letter}.py"]),
+                repo=f"org/repo-{label}",
+                problem_statement=f"Fix the complete problem for repository {label}.",
+                fail_to_pass=(f"test_fix_{label}",),
+                pass_to_pass=(f"test_regression_{label}",),
+                test_patch=f"diff --git a/test_{label}.py b/test_{label}.py\n",
+                selected_test_files_to_run=json.dumps([f"test_{label}.py"]),
             )
-            for letter, instance_id in zip(labels, self.instance_ids, strict=True)
+            for label, instance_id in zip(labels, self.instance_ids, strict=True)
         }
 
     def require(self, instance_id: str) -> SweBenchProInstance:
@@ -1249,6 +1250,34 @@ def test_batch_preview_is_read_only_and_exposes_fixed_facts_usage_and_estimate(
         "block_reason": None,
     }
     assert response.json()["usage"]["used_percent"] == 9
+
+
+def test_stability_batch_preview_and_create_use_the_exact_pinned_subset(
+    config: WebConfig,
+    store: TaskStore,
+) -> None:
+    public_ids = [f"unselected-{index}" for index in range(731)]
+    for source_index, instance_id in STABILITY_V1_CASES:
+        public_ids[source_index] = instance_id
+    client = TestClient(create_app(config, store, catalog=_BatchCatalog(tuple(public_ids))))
+
+    preview = client.post(
+        "/api/batches/preview",
+        json={"powercontext_ref": "latest", "task_set": STABILITY_V1_TASK_SET, "usage_pause_percent": 75},
+    )
+    request = _batch_payload("stability-v1-batch")
+    request["task_set"] = STABILITY_V1_TASK_SET
+    created = client.post("/api/batches", json=request)
+
+    assert preview.status_code == 200
+    assert preview.json()["task_set"] == STABILITY_V1_TASK_SET
+    assert preview.json()["total_tasks"] == 24
+    assert created.status_code == 201
+    assert created.json()["request"]["task_set"] == STABILITY_V1_TASK_SET
+    assert created.json()["total_tasks"] == 24
+    assert [task.instance_id for task in store.list_batch_tasks(created.json()["batch_id"])] == [
+        instance_id for _, instance_id in STABILITY_V1_CASES
+    ]
 
 
 def test_luna_preview_batch_tasks_detail_and_report_keep_the_requested_model(
