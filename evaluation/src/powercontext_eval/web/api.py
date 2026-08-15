@@ -371,9 +371,6 @@ def create_app(
 
     def resolve_powercontext_ref(ref: str) -> str:
         requested = PowerContextRef.parse(ref)
-        if requested.kind == "commit":
-            assert requested.value is not None
-            return requested.value.lower()
         resolved = powercontext_source.resolve(config.powercontext_source, requested)
         return resolved.sha
 

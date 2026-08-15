@@ -24,6 +24,7 @@ from powercontext_eval.benchmarks.swebench_pro.gold_overrides import (
     SOURCE559_REFERENCE_PATCH_SHA256,
     SOURCE559_REFERENCE_REVISION,
 )
+from powercontext_eval.git_source import GitSource
 from powercontext_eval.report import ArmReport, GoldValidationAudit, MetricSet, ReportBundle, TestGroupReport
 from powercontext_eval.web.api import TaskEventStream, create_app
 from powercontext_eval.web.config import WebConfig
@@ -90,6 +91,20 @@ def store(config: WebConfig) -> TaskStore:
     task_store.initialize()
     task_store.save_usage_snapshot(_usage(9))
     return task_store
+
+
+@pytest.fixture(autouse=True)
+def resolve_existing_api_test_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep unrelated API tests focused while exact source validation runs at its real boundary."""
+
+    original = GitSource.resolve
+
+    def resolve(source: GitSource, repository: str | Path, requested: Any) -> Any:
+        if requested.kind == "commit" and requested.value == "a" * 40:
+            return SimpleNamespace(sha="a" * 40)
+        return original(source, repository, requested)
+
+    monkeypatch.setattr(GitSource, "resolve", resolve)
 
 
 @pytest.fixture
@@ -1504,6 +1519,32 @@ def test_batch_confirmation_rejects_unresolvable_latest_before_creating_children
     client = TestClient(create_app(config, store, catalog=_BatchCatalog()))
     request = _batch_payload("batch-unresolvable-source-key")
     request["powercontext_ref"] = "latest"
+
+    response = client.post("/api/batches", json=request)
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "code": "source_unavailable",
+            "message": "The selected PowerContext source could not be resolved.",
+        }
+    }
+    assert store.list_batches() == []
+
+
+def test_batch_confirmation_rejects_unresolvable_exact_commit_before_creating_children(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "missing-exact-commit"
+    config = WebConfig.for_root(
+        root, powercontext_source=root / "source" / "powercontext.git", tokensflow_egress_network="bridge"
+    )
+    store = TaskStore(config.database_path, lease_duration=timedelta(seconds=config.lease_seconds))
+    store.initialize()
+    store.save_usage_snapshot(_usage(9))
+    client = TestClient(create_app(config, store, catalog=_BatchCatalog()))
+    request = _batch_payload("batch-unresolvable-commit-key")
+    request["powercontext_ref"] = "commit:" + "b" * 40
 
     response = client.post("/api/batches", json=request)
 
