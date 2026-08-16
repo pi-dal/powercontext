@@ -49,6 +49,55 @@ function apiWithResponse(response: Response): {
 }
 
 describe("EvaluationApi HTTP", () => {
+  it("accepts an API-key admission response without subscription usage", async () => {
+    const response = { mode: "api_key", sufficient: true, usage: null } as const;
+    const { api, fetch } = apiWithResponse(jsonResponse(response));
+
+    await expect(api.getAccountUsage()).resolves.toEqual(response);
+    expect(fetch).toHaveBeenCalledWith("/api/account-usage", expect.any(Object));
+  });
+
+  it("accepts the secret-free current batch runtime response", async () => {
+    const response = {
+      batch_id: "batch-live",
+      generated_at: "2026-08-16T09:30:00Z",
+      status_counts: {
+        queued: 1,
+        running: 1,
+        succeeded: 22,
+        failed: 0,
+        interrupted: 0,
+        cancelled: 0,
+      },
+      tasks: [
+        {
+          task_id: "task-live",
+          attempt_id: "task-live.attempt-0002",
+          instance_id: "instance_org__repo-live",
+          source_index: 8,
+          status: "running",
+          phase: "running_off",
+          attempt_number: 2,
+          attempt_count: 2,
+          created_at: "2026-08-16T09:20:00Z",
+          eligible_at: "2026-08-16T09:25:00Z",
+          started_at: "2026-08-16T09:26:00Z",
+          last_failure: {
+            category: "report_generation_failure",
+            code: "report_generation",
+            phase: "generating_report",
+            summary: "Safe summary",
+            finished_at: "2026-08-16T09:24:00Z",
+          },
+        },
+      ],
+    } as const;
+    const { api, fetch } = apiWithResponse(jsonResponse(response));
+
+    await expect(api.getBatchRuntime("batch/live")).resolves.toEqual(response);
+    expect(fetch).toHaveBeenCalledWith("/api/batches/batch%2Flive/runtime", expect.any(Object));
+  });
+
   it("accepts a running batch report before any task has reached a terminal state", async () => {
     const runningReport = {
       ...batchReport,

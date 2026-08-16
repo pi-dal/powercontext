@@ -1498,8 +1498,8 @@ def test_api_key_mode_does_not_require_subscription_usage_for_preview_or_creatio
     assert preview.json()["usage"] is None
     assert preview.json()["can_start"] is True
     assert created.status_code == 201
-    assert usage.status_code == 503
-    assert usage.json()["error"]["code"] == "usage_not_applicable"
+    assert usage.status_code == 200
+    assert usage.json() == {"mode": "api_key", "sufficient": True, "usage": None}
 
 
 def test_batch_confirmation_rejects_usage_at_the_selected_threshold(
@@ -1610,7 +1610,9 @@ def test_batch_control_usage_attempt_and_retry_routes_are_durable(
     assert patched.json()["control"]["usage_pause_percent"] == 75
     assert stale_patch.status_code == 409
     assert stale_patch.json()["error"]["code"] == "batch_control_version_conflict"
-    assert usage.json()["used_percent"] == 9
+    assert usage.json()["mode"] == "subscription"
+    assert usage.json()["sufficient"] is True
+    assert usage.json()["usage"]["used_percent"] == 9
     assert [event["event_type"] for event in events.json()] == [
         "batch_created",
         "pause_requested",
@@ -1660,6 +1662,70 @@ def test_batch_control_usage_attempt_and_retry_routes_are_durable(
     assert retried.json() == replayed.json()
     assert [attempt["attempt_number"] for attempt in attempts.json()] == [1, 2]
     assert attempts.json()[0]["failure_summary"] == "Codex execution did not complete"
+
+
+def test_batch_runtime_lists_running_and_retry_waiting_tasks_without_secrets(
+    config: WebConfig,
+    store: TaskStore,
+) -> None:
+    client = TestClient(create_app(config, store, catalog=_BatchCatalog()))
+    batch = client.post("/api/batches", json=_batch_payload("batch-runtime-key")).json()
+    started = datetime.now(UTC) + timedelta(seconds=1)
+
+    running = store.claim_next("runtime-worker-1", now=started, max_concurrency=2)
+    assert running is not None
+    store.set_phase(running.task_id, "runtime-worker-1", TaskPhase.RUNNING_ON, now=started)
+    failed = store.claim_next("runtime-worker-2", now=started, max_concurrency=2)
+    assert failed is not None
+    store.fail(
+        failed.task_id,
+        "runtime-worker-2",
+        SafeFailure(
+            category=FailureCategory.REPORT_GENERATION,
+            failure_code=FailureCode.REPORT_GENERATION,
+            phase=TaskPhase.GENERATING_REPORT,
+            summary="Report assembly failed safely",
+            retry_disposition=RetryDisposition.RETRY,
+        ),
+        now=started + timedelta(seconds=1),
+    )
+    assert _complete_failed_attempt_cleanup(store, failed.task_id, now=started + timedelta(seconds=2)) is True
+
+    response = client.get(f"/api/batches/{batch['batch_id']}/runtime")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["batch_id"] == batch["batch_id"]
+    assert payload["status_counts"] == {
+        "queued": 4,
+        "running": 1,
+        "succeeded": 0,
+        "failed": 0,
+        "interrupted": 0,
+        "cancelled": 0,
+    }
+    assert len(payload["tasks"]) == 2
+    running_payload = next(task for task in payload["tasks"] if task["status"] == "running")
+    retry_payload = next(task for task in payload["tasks"] if task["status"] == "queued")
+    assert running_payload["task_id"] == running.task_id
+    assert running_payload["phase"] == "running_on"
+    assert retry_payload["task_id"] == failed.task_id
+    assert retry_payload["attempt_number"] == 2
+    assert retry_payload["last_failure"] == {
+        "category": "report_generation_failure",
+        "code": "report_generation",
+        "phase": "generating_report",
+        "summary": "Report assembly failed safely",
+        "finished_at": (started + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+    }
+    assert_safe(response)
+
+
+def test_batch_runtime_rejects_an_unknown_batch(config: WebConfig, store: TaskStore) -> None:
+    response = TestClient(create_app(config, store, catalog=_BatchCatalog())).get("/api/batches/missing/runtime")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "batch_not_found"
 
 
 def test_batch_api_creates_replays_lists_gets_and_cancels_the_complete_catalog(

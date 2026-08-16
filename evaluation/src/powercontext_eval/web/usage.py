@@ -68,6 +68,23 @@ class UsageSnapshot(_FrozenModel):
         return self
 
 
+class AccountUsage(_FrozenModel):
+    """Public account admission state without pretending API-key billing is subscription usage."""
+
+    mode: Literal["subscription", "api_key"]
+    sufficient: bool
+    usage: UsageSnapshot | None
+
+    @model_validator(mode="after")
+    def require_mode_consistency(self) -> Self:
+        if self.mode == "api_key":
+            if not self.sufficient or self.usage is not None:
+                raise ValueError("API-key usage must always be sufficient and contain no subscription snapshot")
+        elif self.usage is None:
+            raise ValueError("Subscription usage requires a current snapshot")
+        return self
+
+
 class CodexUsageProbe:
     """Read account usage through a short-lived local Codex App Server."""
 

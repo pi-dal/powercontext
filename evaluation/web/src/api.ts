@@ -1,10 +1,12 @@
 import type {
+  AccountUsage,
   BatchCreate,
   BatchControlEvent,
   BatchEventSubscription,
   BatchPreview,
   BatchRecord,
   BatchReport,
+  BatchRuntime,
   BatchTaskDetail,
   BatchTaskListOptions,
   BatchTaskPage,
@@ -24,7 +26,6 @@ import type {
   TaskRecord,
   TaskStatus,
   TaskSummary,
-  UsageSnapshot,
 } from "./types";
 import { z } from "zod";
 
@@ -353,6 +354,18 @@ const usageSnapshotSchema = z.strictObject({
   account_tokens: nonnegativeIntegerSchema.nullable(),
   probe_version: z.literal(1),
 });
+const accountUsageSchema = z.discriminatedUnion("mode", [
+  z.strictObject({
+    mode: z.literal("api_key"),
+    sufficient: z.literal(true),
+    usage: z.null(),
+  }),
+  z.strictObject({
+    mode: z.literal("subscription"),
+    sufficient: z.boolean(),
+    usage: usageSnapshotSchema,
+  }),
+]);
 const batchControlSchema = z.strictObject({
   intent: z.enum(["run", "pause", "cancel"]),
   usage_pause_percent: z.number().int().min(1).max(100),
@@ -449,6 +462,33 @@ const batchReportSchema = z.strictObject({
   estimate: batchEstimateSchema,
   revisions: z.record(z.string(), z.string()),
   configuration: z.record(z.string(), z.string()),
+});
+const batchRuntimeFailureSchema = z.strictObject({
+  category: failureCategorySchema,
+  code: z.string(),
+  phase: taskPhaseSchema.nullable(),
+  summary: z.string().min(1).max(500),
+  finished_at: timestampSchema,
+});
+const batchRuntimeTaskSchema = z.strictObject({
+  task_id: z.string(),
+  attempt_id: z.string(),
+  instance_id: z.string(),
+  source_index: nonnegativeIntegerSchema,
+  status: z.enum(["queued", "running"]),
+  phase: taskPhaseSchema.nullable(),
+  attempt_number: z.number().int().positive(),
+  attempt_count: z.number().int().positive(),
+  created_at: timestampSchema,
+  eligible_at: timestampSchema,
+  started_at: timestampSchema.nullable(),
+  last_failure: batchRuntimeFailureSchema.nullable(),
+});
+const batchRuntimeSchema = z.strictObject({
+  batch_id: z.string(),
+  generated_at: timestampSchema,
+  status_counts: z.record(taskStatusSchema, nonnegativeIntegerSchema),
+  tasks: z.array(batchRuntimeTaskSchema),
 });
 const taskArmSummarySchema = z.strictObject({
   resolved: z.boolean(),
@@ -653,8 +693,8 @@ function validateContextEventPage(value: unknown): ContextEventPage {
   return validateWithSchema(contextEventPageSchema, value);
 }
 
-function validateUsageSnapshot(value: unknown): UsageSnapshot {
-  return validateWithSchema(usageSnapshotSchema, value);
+function validateAccountUsage(value: unknown): AccountUsage {
+  return validateWithSchema(accountUsageSchema, value);
 }
 
 function validateTaskAttempt(value: unknown): TaskAttempt {
@@ -782,8 +822,14 @@ export class EvaluationApi {
     });
   }
 
-  getAccountUsage(signal?: AbortSignal): Promise<UsageSnapshot> {
-    return this.#json(apiPath("/account-usage"), validateUsageSnapshot, withSignal(signal));
+  getAccountUsage(signal?: AbortSignal): Promise<AccountUsage> {
+    return this.#json(apiPath("/account-usage"), validateAccountUsage, withSignal(signal));
+  }
+
+  getBatchRuntime(batchId: string, signal?: AbortSignal): Promise<BatchRuntime> {
+    return this.#json(batchPath(batchId, "/runtime"), (value) => validateWithSchema(batchRuntimeSchema, value), {
+      ...withSignal(signal),
+    });
   }
 
   listBatchControlEvents(batchId: string, signal?: AbortSignal): Promise<BatchControlEvent[]> {

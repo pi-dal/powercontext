@@ -299,6 +299,10 @@ export interface UsageSnapshot {
   probe_version: 1;
 }
 
+export type AccountUsage =
+  | { mode: "api_key"; sufficient: true; usage: null }
+  | { mode: "subscription"; sufficient: boolean; usage: UsageSnapshot };
+
 export interface BatchControlState {
   intent: BatchControlIntent;
   usage_pause_percent: number;
@@ -485,6 +489,36 @@ export interface BatchControlEvent {
   actor: "user" | "system";
   details: Record<string, number | string | null>;
   occurred_at: string;
+}
+
+export interface BatchRuntimeFailure {
+  category: FailureCategory;
+  code: string;
+  phase: TaskPhase | null;
+  summary: string;
+  finished_at: string;
+}
+
+export interface BatchRuntimeTask {
+  task_id: string;
+  attempt_id: string;
+  instance_id: string;
+  source_index: number;
+  status: "queued" | "running";
+  phase: TaskPhase | null;
+  attempt_number: number;
+  attempt_count: number;
+  created_at: string;
+  eligible_at: string;
+  started_at: string | null;
+  last_failure: BatchRuntimeFailure | null;
+}
+
+export interface BatchRuntime {
+  batch_id: string;
+  generated_at: string;
+  status_counts: Record<TaskStatus, number>;
+  tasks: BatchRuntimeTask[];
 }
 
 export interface BatchTaskPage {

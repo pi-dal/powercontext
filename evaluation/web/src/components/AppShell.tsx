@@ -31,12 +31,19 @@ export function AppShell({ api, path, batchId, navigate, children }: AppShellPro
 
   const encodedBatchId = batchId === null ? null : encodeURIComponent(batchId);
   const taskReport = path.match(/^\/report\/[^/]+\/tasks(?:\/|$)/) !== null;
+  const runtimeReport = path.match(/^\/report\/[^/]+\/running$/) !== null;
   const links = [
     {
       href: encodedBatchId === null ? "/" : `/report/${encodedBatchId}`,
       label: "总体报告",
-      current: !taskReport,
+      current: !taskReport && !runtimeReport,
       disabled: false,
+    },
+    {
+      href: encodedBatchId === null ? "/" : `/report/${encodedBatchId}/running`,
+      label: "当前运行任务",
+      current: runtimeReport,
+      disabled: encodedBatchId === null,
     },
     {
       href: encodedBatchId === null ? "/" : `/report/${encodedBatchId}/tasks`,

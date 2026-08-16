@@ -33,6 +33,9 @@ from powercontext_eval.web.batches import (
     BatchCreate,
     BatchPreviewResponse,
     BatchRecord,
+    BatchRuntimeFailure,
+    BatchRuntimeResponse,
+    BatchRuntimeTask,
     PairCategory,
     TaskRetryRequest,
 )
@@ -58,7 +61,7 @@ from powercontext_eval.web.reporting import (
 from powercontext_eval.web.resources import FilesystemResourceProbe, ResourceProbe, ResourceUnavailable
 from powercontext_eval.web.revision import RUNTIME_SCHEMA_VERSION, current_build_revision
 from powercontext_eval.web.store import BatchNotFound, TaskAdmissionRejected, TaskConflict, TaskNotFound, TaskStore
-from powercontext_eval.web.usage import UsageSnapshot, is_fresh
+from powercontext_eval.web.usage import AccountUsage, UsageSnapshot, is_fresh
 
 _TERMINAL = {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.INTERRUPTED, TaskStatus.CANCELLED}
 _NO_STORE = {"Cache-Control": "no-store"}
@@ -633,16 +636,15 @@ def create_app(
 
     @app.get("/api/account-usage")
     def account_usage() -> Response:
+        if config.usage_mode == "api_key":
+            response = AccountUsage(mode="api_key", sufficient=True, usage=None)
+            return JSONResponse(content=response.model_dump(mode="json"), headers=_NO_STORE)
         snapshot = current_usage()
         if snapshot is None:
-            code = "usage_not_applicable" if config.usage_mode == "api_key" else "usage_unavailable"
-            message = (
-                "Subscription usage does not apply to API-key authentication."
-                if config.usage_mode == "api_key"
-                else "Current Codex subscription usage is unavailable."
-            )
-            return _error(503, code, message)
-        return JSONResponse(content=snapshot.model_dump(mode="json"), headers=_NO_STORE)
+            return _error(503, "usage_unavailable", "Current Codex subscription usage is unavailable.")
+        sufficient = snapshot.rate_limit_reached_type is None and snapshot.used_percent < config.usage_pause_percent
+        response = AccountUsage(mode="subscription", sufficient=sufficient, usage=snapshot)
+        return JSONResponse(content=response.model_dump(mode="json"), headers=_NO_STORE)
 
     @app.post("/api/batches/{batch_id}/tasks/{task_id}/retry")
     def retry_batch_task(batch_id: str, task_id: str, request: TaskRetryRequest) -> Response:
@@ -690,6 +692,73 @@ def create_app(
             content=[attempt.model_dump(mode="json") for attempt in attempts],
             headers=_NO_STORE,
         )
+
+    @app.get("/api/batches/{batch_id}/runtime")
+    def batch_runtime(batch_id: str) -> Response:
+        try:
+            tasks = task_store.list_batch_tasks(batch_id)
+        except BatchNotFound:
+            return _error(404, "batch_not_found", "The requested evaluation batch does not exist.")
+
+        status_counts = {status: 0 for status in TaskStatus}
+        runtime_tasks: list[BatchRuntimeTask] = []
+        for task in tasks:
+            status_counts[task.status] += 1
+            if task.status is not TaskStatus.RUNNING and not (
+                task.status is TaskStatus.QUEUED and task.attempt_number > 1
+            ):
+                continue
+            if task.attempt_id is None or task.instance_id is None or task.source_index is None:
+                continue
+            previous_failure = next(
+                (
+                    attempt
+                    for attempt in reversed(task_store.list_task_attempts(batch_id, task.task_id))
+                    if attempt.attempt_number < task.attempt_number
+                    and attempt.failure_category is not None
+                    and attempt.failure_code is not None
+                    and attempt.failure_summary is not None
+                    and attempt.finished_at is not None
+                ),
+                None,
+            )
+            last_failure = None
+            if previous_failure is not None:
+                category = previous_failure.failure_category
+                code = previous_failure.failure_code
+                summary = previous_failure.failure_summary
+                finished_at = previous_failure.finished_at
+                if category is not None and code is not None and summary is not None and finished_at is not None:
+                    last_failure = BatchRuntimeFailure(
+                        category=category,
+                        code=code,
+                        phase=previous_failure.failure_phase,
+                        summary=summary,
+                        finished_at=finished_at,
+                    )
+            runtime_tasks.append(
+                BatchRuntimeTask(
+                    task_id=task.task_id,
+                    attempt_id=task.attempt_id,
+                    instance_id=task.instance_id,
+                    source_index=task.source_index,
+                    status=task.status,
+                    phase=task.phase,
+                    attempt_number=task.attempt_number,
+                    attempt_count=task.attempt_count,
+                    created_at=task.created_at,
+                    eligible_at=task.eligible_at,
+                    started_at=task.started_at,
+                    last_failure=last_failure,
+                )
+            )
+        response = BatchRuntimeResponse(
+            batch_id=batch_id,
+            generated_at=datetime.now(UTC),
+            status_counts=status_counts,
+            tasks=tuple(runtime_tasks),
+        )
+        return JSONResponse(content=response.model_dump(mode="json"), headers=_NO_STORE)
 
     @app.get("/api/batches/{batch_id}/events")
     def batch_events(batch_id: str, request: Request) -> Response:
