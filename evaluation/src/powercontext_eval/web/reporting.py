@@ -343,7 +343,7 @@ def _load_batch_bundle(run_dir: Path, run_root: Path) -> ReportBundle:
 def _bundle_for_task(task: TaskRecord, runs_root: Path) -> ReportBundle:
     if task.status is not TaskStatus.SUCCEEDED or task.result is None:
         raise InvalidReportArtifact
-    bundle = _load_batch_bundle(_task_run_dir(task, runs_root), runs_root)
+    bundle = _load_batch_bundle(task_run_dir(task, runs_root), runs_root)
     if (
         bundle.off.arm != "off"
         or bundle.on.arm != "on"
@@ -355,7 +355,7 @@ def _bundle_for_task(task: TaskRecord, runs_root: Path) -> ReportBundle:
     return bundle
 
 
-def _task_run_dir(task: TaskRecord, runs_root: Path) -> Path:
+def task_run_dir(task: TaskRecord, runs_root: Path) -> Path:
     if task.result is None:
         raise InvalidReportArtifact
     if task.attempt_number == 1:
@@ -813,7 +813,7 @@ def load_context_page(
         raise InvalidReportArtifact
     if limit < 1 or offset < 0:
         raise ValueError("Context page bounds are invalid")
-    events = _load_context_events(_task_run_dir(task, runs_root), runs_root, arm)
+    events = _load_context_events(task_run_dir(task, runs_root), runs_root, arm)
     return ContextEventPage(items=events[offset : offset + limit], total=len(events), limit=limit, offset=offset)
 
 
@@ -829,7 +829,7 @@ def load_context_event(
 
     if sequence < 1 or task.batch_id != batch.batch_id or task.status is not TaskStatus.SUCCEEDED:
         raise InvalidReportArtifact
-    events = _load_context_events(_task_run_dir(task, runs_root), runs_root, arm)
+    events = _load_context_events(task_run_dir(task, runs_root), runs_root, arm)
     if sequence > len(events):
         raise InvalidReportArtifact
     return events[sequence - 1]

@@ -519,7 +519,7 @@ def test_every_api_method_uses_fixed_no_store_error_envelope(client: TestClient,
         assert response.json() == {"error": {"code": "not_found", "message": "The requested API route does not exist."}}
 
 
-def _write_report(run_root: Path, task_id: str) -> None:
+def _write_treatment_evidence(run_root: Path, task_id: str) -> None:
     run_dir = run_root / task_id
     for arm in ("off", "on"):
         target = run_dir / "arms" / arm / "powercontext"
@@ -538,6 +538,11 @@ def _write_report(run_root: Path, task_id: str) -> None:
                 }
             )
         )
+
+
+def _write_report(run_root: Path, task_id: str) -> None:
+    run_dir = run_root / task_id
+    _write_treatment_evidence(run_root, task_id)
 
     def arm(name: Literal["off", "on"]) -> ArmReport:
         return ArmReport(
@@ -1921,7 +1926,9 @@ def test_batch_report_uses_the_successful_retry_once_and_reads_its_attempt_artif
         off_tokens=(100, 10),
         on_tokens=(80, 8),
     )
+    _write_treatment_evidence(config.run_root / "runs", retry_run_id)
     run_dir = config.run_root / "runs" / retry_run_id
+    (run_dir / "report.md").write_text("# Successful retry\n")
     store.succeed(
         task.task_id,
         "batch-worker",
@@ -1935,6 +1942,8 @@ def test_batch_report_uses_the_successful_retry_once_and_reads_its_attempt_artif
     )
 
     report = client.get(f"/api/batches/{batch['batch_id']}/report")
+    task_report = client.get(f"/api/tasks/{task.task_id}/report")
+    raw_task_report = client.get(f"/api/tasks/{task.task_id}/report.md")
     task_page = client.get(f"/api/batches/{batch['batch_id']}/tasks")
     latest_detail = client.get(f"/api/batches/{batch['batch_id']}/tasks/{task.task_id}")
     first_detail = client.get(
@@ -1950,6 +1959,10 @@ def test_batch_report_uses_the_successful_retry_once_and_reads_its_attempt_artif
     assert report.json()["comparable_pairs"] == 1
     assert report.json()["execution_failures"] == 0
     assert report.json()["on"]["resolved"] == 1
+    assert task_report.status_code == 200
+    assert task_report.json()["task_id"] == task.task_id
+    assert raw_task_report.status_code == 200
+    assert raw_task_report.text == "# Successful retry\n"
     item = task_page.json()["items"][0]
     assert item["attempt_number"] == item["attempt_count"] == 2
     assert item["pair_category"] == "off_fail_on_pass"
