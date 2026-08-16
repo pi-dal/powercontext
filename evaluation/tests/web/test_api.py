@@ -1480,6 +1480,28 @@ def test_batch_preview_and_confirmation_fail_closed_without_fresh_usage(tmp_path
     assert store.list_batches() == []
 
 
+def test_api_key_mode_does_not_require_subscription_usage_for_preview_or_creation(tmp_path: Path) -> None:
+    root = tmp_path / "api-key-mode"
+    config = WebConfig.for_root(root, tokensflow_egress_network="bridge", usage_mode="api_key")
+    store = TaskStore(config.database_path, lease_duration=timedelta(seconds=config.lease_seconds))
+    store.initialize()
+    client = TestClient(create_app(config, store, catalog=_BatchCatalog()))
+
+    preview = client.post(
+        "/api/batches/preview",
+        json={"powercontext_ref": "latest", "usage_pause_percent": 80},
+    )
+    created = client.post("/api/batches", json=_batch_payload("batch-api-key-mode"))
+    usage = client.get("/api/account-usage")
+
+    assert preview.status_code == 200
+    assert preview.json()["usage"] is None
+    assert preview.json()["can_start"] is True
+    assert created.status_code == 201
+    assert usage.status_code == 503
+    assert usage.json()["error"]["code"] == "usage_not_applicable"
+
+
 def test_batch_confirmation_rejects_usage_at_the_selected_threshold(
     config: WebConfig,
     store: TaskStore,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -70,12 +70,14 @@ class WebConfig(BaseModel):
     uv_binary: Path
     registry_binary: Path
     auth_json: Path = Field(exclude=True, repr=False)
+    codex_config: Path | None = Field(default=None, exclude=True, repr=False)
     proxy_url: str = Field(exclude=True, repr=False)
     host: str = Field(default="127.0.0.1", min_length=1)
     port: Annotated[int, Field(ge=1, le=65535)] = 8080
     lease_seconds: Annotated[int, Field(ge=1, le=3600)] = 60
     poll_seconds: Annotated[float, Field(gt=0, le=30)] = 1.0
     usage_pause_percent: Annotated[int, Field(ge=1, le=100)] = 80
+    usage_mode: Literal["subscription", "api_key"] = "subscription"
     usage_probe_seconds: Annotated[int, Field(ge=10, le=3600)] = 60
     usage_probe_timeout_seconds: Annotated[int, Field(ge=1, le=60)] = 15
     usage_snapshot_max_age_seconds: Annotated[int, Field(ge=10, le=7200)] = 120
@@ -109,6 +111,13 @@ class WebConfig(BaseModel):
     @classmethod
     def require_absolute_path(cls, value: Path) -> Path:
         if not value.is_absolute():
+            raise ValueError("Runtime paths must be absolute")
+        return value
+
+    @field_validator("codex_config")
+    @classmethod
+    def require_optional_absolute_path(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
             raise ValueError("Runtime paths must be absolute")
         return value
 
@@ -155,12 +164,14 @@ class WebConfig(BaseModel):
         uv_binary: Path | None = None,
         registry_binary: Path | None = None,
         auth_json: Path | None = None,
+        codex_config: Path | None = None,
         proxy_url: str = "http://127.0.0.1:7890",
         host: str = "127.0.0.1",
         port: int = 8080,
         lease_seconds: int = 60,
         poll_seconds: float = 1.0,
         usage_pause_percent: int = 80,
+        usage_mode: Literal["subscription", "api_key"] = "subscription",
         usage_probe_seconds: int = 60,
         usage_probe_timeout_seconds: int = 15,
         usage_snapshot_max_age_seconds: int = 120,
@@ -191,12 +202,14 @@ class WebConfig(BaseModel):
             uv_binary=uv_binary or root / "bin" / "uv",
             registry_binary=registry_binary or root / "bin" / "regctl",
             auth_json=auth_json or root / "codex-home" / "auth.json",
+            codex_config=codex_config,
             proxy_url=proxy_url,
             host=host,
             port=port,
             lease_seconds=lease_seconds,
             poll_seconds=poll_seconds,
             usage_pause_percent=usage_pause_percent,
+            usage_mode=usage_mode,
             usage_probe_seconds=usage_probe_seconds,
             usage_probe_timeout_seconds=usage_probe_timeout_seconds,
             usage_snapshot_max_age_seconds=usage_snapshot_max_age_seconds,
@@ -243,6 +256,9 @@ class WebConfig(BaseModel):
                 "workspace_reclaim_interval_seconds": environ.get(f"{prefix}WORKSPACE_RECLAIM_INTERVAL_SECONDS", "10"),
             }
         )
+        usage_mode = environ.get(f"{prefix}USAGE_MODE", "subscription")
+        if usage_mode not in {"subscription", "api_key"}:
+            raise ValueError("Usage mode must be subscription or api_key")
 
         return cls.for_root(
             root,
@@ -260,12 +276,14 @@ class WebConfig(BaseModel):
             uv_binary=path("UV_BINARY"),
             registry_binary=path("REGISTRY_BINARY"),
             auth_json=path("AUTH_JSON"),
+            codex_config=path("CODEX_CONFIG"),
             proxy_url=environ.get(f"{prefix}PROXY_URL", "http://127.0.0.1:7890"),
             host=environ.get(f"{prefix}HOST", "127.0.0.1"),
             port=numbers.port,
             lease_seconds=numbers.lease_seconds,
             poll_seconds=numbers.poll_seconds,
             usage_pause_percent=numbers.usage_pause_percent,
+            usage_mode=usage_mode,
             usage_probe_seconds=numbers.usage_probe_seconds,
             usage_probe_timeout_seconds=numbers.usage_probe_timeout_seconds,
             usage_snapshot_max_age_seconds=numbers.usage_snapshot_max_age_seconds,

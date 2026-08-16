@@ -511,6 +511,7 @@ class ArmPaths:
     pc_home: Path
     tokensflow_home: Path
     result_root: Path
+    codex_config_source: Path | None = None
 
     def __post_init__(self) -> None:
         paths = (
@@ -524,6 +525,8 @@ class ArmPaths:
         )
         if any(not path.is_absolute() for path in paths):
             raise UnsafeSutConfiguration("Arm paths must be absolute")
+        if self.codex_config_source is not None and not self.codex_config_source.is_absolute():
+            raise UnsafeSutConfiguration("Codex config source must be absolute")
         if self.codex_home.is_relative_to(self.result_root) or self.pc_home.is_relative_to(self.result_root):
             raise UnsafeSutConfiguration("Private homes must remain outside retained results")
         if not self.codex_home.is_relative_to(self.runtime) or not self.pc_home.is_relative_to(self.runtime):
@@ -576,6 +579,36 @@ class ArmPaths:
             os.fsync(destination_fd)
         except FileExistsError as error:
             raise UnsafeSutConfiguration("Ephemeral auth destination already exists") from error
+        finally:
+            os.close(source_fd)
+            if destination_fd >= 0:
+                os.close(destination_fd)
+        return destination
+
+    def copy_codex_config(self) -> Path | None:
+        """Copy an optional provider-only config through no-follow descriptors at mode 0600."""
+
+        if self.codex_config_source is None:
+            return None
+        self.codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination = self.codex_home / "config.toml"
+        source_fd = os.open(self.codex_config_source, os.O_RDONLY | os.O_NOFOLLOW)
+        destination_fd = -1
+        try:
+            metadata = os.fstat(source_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise UnsafeSutConfiguration("Codex config source must be a regular file")
+            destination_fd = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            while chunk := os.read(source_fd, 64 * 1024):
+                os.write(destination_fd, chunk)
+            os.fchmod(destination_fd, 0o600)
+            os.fsync(destination_fd)
+        except FileExistsError as error:
+            raise UnsafeSutConfiguration("Ephemeral Codex config destination already exists") from error
         finally:
             os.close(source_fd)
             if destination_fd >= 0:
@@ -973,6 +1006,7 @@ class DockerSut:
         try:
             paths.prepare()
             paths.copy_auth()
+            paths.copy_codex_config()
             self._stage_recorder(config, paths)
             self._stage_tokensflow_wrapper(paths)
             tokensflow_wrapper_staged = True

@@ -315,16 +315,18 @@ export function BatchLauncher({ api, onCreated }: BatchLauncherProps) {
               <p className="eyebrow">确认信息</p>
               <h3>{number(preview.total_tasks)} 个基准任务</h3>
             </div>
-            <strong className="usage-reading">当前用量 {preview.usage.used_percent}%</strong>
+            <strong className="usage-reading">
+              {preview.usage === null ? "API Key 计费" : `当前用量 ${preview.usage.used_percent}%`}
+            </strong>
           </div>
           <dl className="preview-facts">
             <div><dt>任务集</dt><dd>SWE-bench Pro public v2</dd></div>
             <div><dt>运行方式</dt><dd>每个任务 OFF / ON 配对执行</dd></div>
             <div><dt>Codex 模型</dt><dd>{preview.model} · {preview.reasoning_effort}</dd></div>
-            <div><dt>暂停阈值</dt><dd>{preview.usage_pause_percent}%</dd></div>
-            <div><dt>计量窗口</dt><dd>{formatUsageWindow(preview.usage.window_duration_minutes)}</dd></div>
-            <div><dt>额度重置</dt><dd>{dateTime(preview.usage.resets_at)}</dd></div>
-            <div><dt>用量采样</dt><dd>{dateTime(preview.usage.observed_at)}</dd></div>
+            <div><dt>暂停阈值</dt><dd>{preview.usage === null ? "不适用" : `${preview.usage_pause_percent}%`}</dd></div>
+            <div><dt>计量窗口</dt><dd>{preview.usage === null ? "API Key" : formatUsageWindow(preview.usage.window_duration_minutes)}</dd></div>
+            <div><dt>额度重置</dt><dd>{preview.usage === null ? "由 Provider 管理" : dateTime(preview.usage.resets_at)}</dd></div>
+            <div><dt>用量采样</dt><dd>{preview.usage === null ? "不采集订阅用量" : dateTime(preview.usage.observed_at)}</dd></div>
             <div>
               <dt>剩余估算</dt>
               <dd>

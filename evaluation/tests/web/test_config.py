@@ -72,9 +72,11 @@ def test_web_config_defaults_match_m0_layout() -> None:
     assert config.tokensflow_egress_network == "bridge"
     assert config.uv_binary == root / "bin" / "uv"
     assert config.auth_json == root / "codex-home" / "auth.json"
+    assert config.codex_config is None
     assert config.proxy_url == "http://127.0.0.1:7890"
     assert config.frontend_dist == root / "deploy" / "powercontext" / "evaluation" / "web" / "dist"
     assert config.usage_pause_percent == 80
+    assert config.usage_mode == "subscription"
     assert config.usage_probe_seconds == 60
     assert config.usage_probe_timeout_seconds == 15
     assert config.usage_snapshot_max_age_seconds == 120
@@ -94,6 +96,29 @@ def test_web_config_parses_deduplicates_and_preserves_configured_codex_models(tm
     )
 
     assert config.codex_models == ("gpt-5.6-sol", "gpt-5.6-luna")
+
+
+def test_web_config_accepts_api_key_usage_mode(tmp_path: Path) -> None:
+    config = WebConfig.from_environment(
+        {
+            "POWERCONTEXT_EVAL_ROOT": str(tmp_path),
+            "POWERCONTEXT_EVAL_TOKENSFLOW_EGRESS_NETWORK": "bridge",
+            "POWERCONTEXT_EVAL_USAGE_MODE": "api_key",
+        }
+    )
+
+    assert config.usage_mode == "api_key"
+
+
+def test_web_config_rejects_unknown_usage_mode(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        WebConfig.from_environment(
+            {
+                "POWERCONTEXT_EVAL_ROOT": str(tmp_path),
+                "POWERCONTEXT_EVAL_TOKENSFLOW_EGRESS_NETWORK": "bridge",
+                "POWERCONTEXT_EVAL_USAGE_MODE": "unknown",
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -209,6 +234,7 @@ def test_web_config_rejects_unsafe_tokensflow_egress_network(tmp_path: Path, net
         ("POWERCONTEXT_EVAL_UV_BINARY", "uv"),
         ("POWERCONTEXT_EVAL_REGISTRY_BINARY", "regctl"),
         ("POWERCONTEXT_EVAL_AUTH_JSON", "auth.json"),
+        ("POWERCONTEXT_EVAL_CODEX_CONFIG", "config.toml"),
     ],
 )
 def test_web_config_rejects_relative_paths(tmp_path: Path, name: str, value: str) -> None:
@@ -297,6 +323,7 @@ def test_web_config_has_no_public_serialization_that_leaks_secrets(tmp_path: Pat
     config = WebConfig.for_root(
         tmp_path,
         auth_json=tmp_path / "auth-secret.json",
+        codex_config=tmp_path / "provider-secret.toml",
         tokensflow_user_home=tmp_path / "identity-profile",
         tokensflow_egress_network="bridge",
         proxy_url=secret,
@@ -304,10 +331,12 @@ def test_web_config_has_no_public_serialization_that_leaks_secrets(tmp_path: Pat
 
     assert not hasattr(config, "to_public")
     assert "auth_json" not in config.model_dump()
+    assert "codex_config" not in config.model_dump()
     assert "proxy_url" not in config.model_dump()
     assert "tokensflow_user_home" not in config.model_dump()
     assert secret not in repr(config)
     assert "auth-secret.json" not in repr(config)
+    assert "provider-secret.toml" not in repr(config)
     assert "identity-profile" not in repr(config)
 
 

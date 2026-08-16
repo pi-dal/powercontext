@@ -77,6 +77,7 @@ class CodexUsageProbe:
         codex_binary: Path,
         auth_json: Path,
         proxy_url: str,
+        codex_config: Path | None = None,
         timeout_seconds: float = 15,
         output_limit_bytes: int = _DEFAULT_OUTPUT_LIMIT_BYTES,
     ) -> None:
@@ -84,6 +85,8 @@ class CodexUsageProbe:
             raise ValueError("codex_binary must be an absolute Path")
         if not isinstance(auth_json, Path) or not auth_json.is_absolute():
             raise ValueError("auth_json must be an absolute Path")
+        if codex_config is not None and (not isinstance(codex_config, Path) or not codex_config.is_absolute()):
+            raise ValueError("codex_config must be an absolute Path")
         if not isinstance(proxy_url, str) or not proxy_url or "\0" in proxy_url:
             raise ValueError("proxy_url must be a non-empty string")
         if (
@@ -98,6 +101,7 @@ class CodexUsageProbe:
 
         self._codex_binary = codex_binary
         self._auth_json = auth_json
+        self._codex_config = codex_config
         self._proxy_url = proxy_url
         self._timeout_seconds = float(timeout_seconds)
         self._output_limit_bytes = output_limit_bytes
@@ -108,6 +112,8 @@ class CodexUsageProbe:
         _require_utc(now, name="now")
         if not self._auth_json.is_file():
             raise UsageUnavailable("Codex authorization is unavailable")
+        if self._codex_config is not None and (not self._codex_config.is_file() or self._codex_config.is_symlink()):
+            raise UsageUnavailable("Codex provider configuration is unavailable")
 
         try:
             with tempfile.TemporaryDirectory(prefix="powercontext-eval-codex-") as temporary:
@@ -115,6 +121,10 @@ class CodexUsageProbe:
                 auth_copy = codex_home / "auth.json"
                 shutil.copyfile(self._auth_json, auth_copy)
                 auth_copy.chmod(0o600)
+                if self._codex_config is not None:
+                    config_copy = codex_home / "config.toml"
+                    shutil.copyfile(self._codex_config, config_copy)
+                    config_copy.chmod(0o600)
                 output = self._run(codex_home)
         except OSError:
             raise UsageUnavailable("Codex usage probe failed") from None

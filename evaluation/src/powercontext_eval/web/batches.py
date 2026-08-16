@@ -58,7 +58,7 @@ class BatchPreviewResponse(_FrozenModel):
     treatment_mode: Literal["off_on"]
     total_tasks: Annotated[int, Field(ge=1)]
     usage_pause_percent: Annotated[int, Field(ge=1, le=100)]
-    usage: UsageSnapshot
+    usage: UsageSnapshot | None
     estimate: BatchEstimate
     can_start: bool
     block_reason: Literal["usage_threshold_reached"] | None = None

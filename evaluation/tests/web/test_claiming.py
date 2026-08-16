@@ -4,7 +4,7 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -76,11 +76,17 @@ class AdvancingClock:
             return now
 
 
-def _config(root: Path, *, task_parallelism: int = 4) -> WebConfig:
+def _config(
+    root: Path,
+    *,
+    task_parallelism: int = 4,
+    usage_mode: Literal["subscription", "api_key"] = "subscription",
+) -> WebConfig:
     return WebConfig.for_root(
         root,
         tokensflow_egress_network="bridge",
         task_parallelism=task_parallelism,
+        usage_mode=usage_mode,
         usage_probe_seconds=60,
         usage_snapshot_max_age_seconds=120,
     )
@@ -134,6 +140,20 @@ def test_concurrent_claims_share_one_fresh_account_usage_probe(tmp_path: Path) -
     assert probe.maximum_active == 1
     assert len(tasks) == 4
     assert len({task.task_id for task in tasks}) == 4
+
+
+def test_api_key_mode_claims_without_subscription_usage_probe(tmp_path: Path) -> None:
+    config = _config(tmp_path, task_parallelism=1, usage_mode="api_key")
+    store = _store(config)
+    _batch(store, count=1)
+    probe = CountingProbe([UsageUnavailable("must not be called")])
+    coordinator = ClaimCoordinator(config, store, usage_probe=probe, clock=lambda: NOW)
+
+    claimed = coordinator.claim("slot-api-key")
+
+    assert claimed is not None
+    assert probe.calls == []
+    assert store.latest_usage_snapshot() is None
 
 
 def test_periodic_usage_refresh_keeps_snapshot_current_without_new_claims(tmp_path: Path) -> None:

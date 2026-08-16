@@ -155,6 +155,7 @@ class TaskPairWorker:
         self._usage_probe = usage_probe or CodexUsageProbe(
             codex_binary=config.codex_binary,
             auth_json=config.auth_json,
+            codex_config=config.codex_config,
             proxy_url=config.proxy_url,
             timeout_seconds=config.usage_probe_timeout_seconds,
         )
@@ -303,6 +304,7 @@ class TaskPairWorker:
             uv_binary=self._config.uv_binary,
             registry_binary=self._config.registry_binary,
             auth_json=self._config.auth_json,
+            codex_config=self._config.codex_config,
             proxy_url=self._config.proxy_url,
             run_id=_execution_run_id(task),
             model=task.request.model,
@@ -327,6 +329,7 @@ class TaskPairWorker:
             uv_binary=self._config.uv_binary,
             registry_binary=self._config.registry_binary,
             auth_json=self._config.auth_json,
+            codex_config=self._config.codex_config,
             proxy_url=self._config.proxy_url,
             run_id=_execution_run_id(task),
             model=task.request.model,
@@ -489,6 +492,7 @@ class EvaluationWorker:
         shared_probe = usage_probe or CodexUsageProbe(
             codex_binary=config.codex_binary,
             auth_json=config.auth_json,
+            codex_config=config.codex_config,
             proxy_url=config.proxy_url,
             timeout_seconds=config.usage_probe_timeout_seconds,
         )

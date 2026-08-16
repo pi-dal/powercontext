@@ -78,15 +78,23 @@ class ClaimCoordinator:
                 capacity = None
             if capacity is None or not self._resource_admitted(capacity):
                 return None
-            try:
-                snapshot = self._usage_before_claim(now)
-            except UsageUnavailable:
-                return None
+            snapshot: UsageSnapshot | None = None
+            if self._config.usage_mode == "subscription":
+                try:
+                    snapshot = self._usage_before_claim(now)
+                except UsageUnavailable:
+                    return None
             if self._stopped.is_set():
                 return None
             with self._claim_commit_lock:
                 if self._stopped.is_set():
                     return None
+                if snapshot is None:
+                    return self._store.claim_next(
+                        worker_id,
+                        max_concurrency=self._config.task_parallelism,
+                        now=now,
+                    )
                 return self._store.claim_next_with_usage(
                     worker_id,
                     snapshot=snapshot,
@@ -110,6 +118,8 @@ class ClaimCoordinator:
             return self._refresh_usage_locked(self._clock())
 
     def _refresh_usage_locked(self, now: datetime) -> bool:
+        if self._config.usage_mode == "api_key":
+            return True
         try:
             snapshot = self._usage_probe.read(now=now)
             self._store.apply_usage_snapshot(snapshot, now=now)

@@ -139,6 +139,7 @@ class RunConfig:
     auth_json: Path
     proxy_url: str
     run_id: str
+    codex_config: Path | None = None
     model: str = DEFAULT_CODEX_MODEL
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     finalization_registrar: TokensFlowFinalizationRegistrar | None = None
@@ -330,6 +331,7 @@ def _run_swebench_pro_instance(
             arm_paths[arm] = ArmPaths(
                 source=materialized,
                 auth_source=config.auth_json,
+                codex_config_source=config.codex_config,
                 workspace=arm_work / "workspace",
                 runtime=runtime,
                 codex_home=root_home / ".codex",
@@ -484,6 +486,7 @@ class MinimalRunConfig:
     auth_json: Path
     proxy_url: str
     run_id: str | None = None
+    codex_config: Path | None = None
     model: str = DEFAULT_CODEX_MODEL
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     finalization_registrar: TokensFlowFinalizationRegistrar | None = None
@@ -525,6 +528,7 @@ def run_minimal_swebench_pro(
             auth_json=config.auth_json,
             proxy_url=config.proxy_url,
             run_id=run_id,
+            codex_config=config.codex_config,
             model=config.model,
             reasoning_effort=config.reasoning_effort,
             finalization_registrar=config.finalization_registrar,

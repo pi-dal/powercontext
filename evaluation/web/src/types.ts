@@ -366,7 +366,7 @@ export interface BatchPreview {
   treatment_mode: "off_on";
   total_tasks: number;
   usage_pause_percent: number;
-  usage: UsageSnapshot;
+  usage: UsageSnapshot | null;
   estimate: BatchEstimate;
   can_start: boolean;
   block_reason: "usage_threshold_reached" | null;

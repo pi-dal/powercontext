@@ -24,6 +24,18 @@ function preview(overrides: Record<string, unknown> = {}) {
 }
 
 describe("BatchLauncher", () => {
+  it("shows API-key accounting without a subscription usage snapshot", async () => {
+    const user = userEvent.setup();
+    const previewBatch = vi.fn().mockResolvedValue(preview({ usage: null }));
+    render(<BatchLauncher api={apiStub({ previewBatch })} onCreated={() => undefined} />);
+
+    await user.click(screen.getByRole("button", { name: "预览评测" }));
+
+    expect(await screen.findByText("API Key 计费")).toBeVisible();
+    expect(screen.getByText("不适用")).toBeVisible();
+    expect(screen.getByText("不采集订阅用量")).toBeVisible();
+  });
+
   it("previews without creating work, then confirms the exact fixed batch", async () => {
     const user = userEvent.setup();
     const previewBatch = vi.fn().mockResolvedValue(preview());

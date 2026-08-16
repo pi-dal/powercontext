@@ -402,7 +402,7 @@ const batchPreviewSchema = z.strictObject({
   treatment_mode: z.literal("off_on"),
   total_tasks: z.number().int().positive(),
   usage_pause_percent: z.number().int().min(1).max(100),
-  usage: usageSnapshotSchema,
+  usage: usageSnapshotSchema.nullable(),
   estimate: batchEstimateSchema,
   can_start: z.boolean(),
   block_reason: z.literal("usage_threshold_reached").nullable(),

@@ -33,6 +33,7 @@ import time
 
 home = Path(os.environ["CODEX_HOME"])
 auth_path = home / "auth.json"
+config_path = home / "config.toml"
 auth = json.loads(auth_path.read_text())
 requests = []
 for _request in range(4):
@@ -48,6 +49,8 @@ if record_path:
         "codex_home": str(home),
         "home_files": sorted(path.name for path in home.iterdir()),
         "auth_mode": oct(auth_path.stat().st_mode & 0o777),
+        "config_mode": oct(config_path.stat().st_mode & 0o777) if config_path.exists() else None,
+        "config_text": config_path.read_text() if config_path.exists() else None,
         "proxy": os.environ.get("HTTPS_PROXY"),
     }))
 
@@ -145,6 +148,7 @@ def probe(
     fake_codex: Path,
     auth_json: Path,
     *,
+    codex_config: Path | None = None,
     timeout_seconds: float = 5,
     output_limit_bytes: int = 1_048_576,
 ) -> CodexUsageProbe:
@@ -152,6 +156,7 @@ def probe(
         codex_binary=fake_codex,
         auth_json=auth_json,
         proxy_url="http://127.0.0.1:7890",
+        codex_config=codex_config,
         timeout_seconds=timeout_seconds,
         output_limit_bytes=output_limit_bytes,
     )
@@ -187,6 +192,22 @@ def test_probe_reads_normalized_subscription_usage_and_sends_exact_protocol(
     assert record["home_files"] == ["auth.json"]
     assert record["auth_mode"] == "0o600"
     assert record["proxy"] == "http://127.0.0.1:7890"
+    assert not Path(record["codex_home"]).exists()
+
+
+def test_probe_copies_optional_codex_config_into_ephemeral_home(tmp_path: Path, fake_codex: Path) -> None:
+    record_path = tmp_path / "record.json"
+    auth_json = write_auth(tmp_path, record_path=str(record_path))
+    codex_config = tmp_path / "provider.toml"
+    codex_config.write_text('model_provider = "relay"\n', encoding="utf-8")
+    codex_config.chmod(0o600)
+
+    probe(fake_codex, auth_json, codex_config=codex_config).read(now=NOW)
+
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["home_files"] == ["auth.json", "config.toml"]
+    assert record["config_mode"] == "0o600"
+    assert record["config_text"] == 'model_provider = "relay"\n'
     assert not Path(record["codex_home"]).exists()
 
 

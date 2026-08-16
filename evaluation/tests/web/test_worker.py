@@ -895,6 +895,7 @@ def test_run_once_maps_config_phases_and_success(monkeypatch: pytest.MonkeyPatch
     assert mapped.tokensflow_user_home == config.tokensflow_user_home
     assert mapped.uv_binary == config.uv_binary
     assert mapped.auth_json == config.auth_json
+    assert mapped.codex_config == config.codex_config
     assert mapped.proxy_url == config.proxy_url
     assert observed == [(TaskPhase(phase.value), True) for phase in RunPhase]
     assert loaded == [(config.run_root / "runs" / task.task_id, config.run_root / "runs")]

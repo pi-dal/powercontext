@@ -361,6 +361,8 @@ def create_app(
         return benchmark_catalog
 
     def current_usage() -> UsageSnapshot | None:
+        if config.usage_mode == "api_key":
+            return None
         snapshot = task_store.latest_usage_snapshot()
         if snapshot is None or not is_fresh(
             snapshot,
@@ -482,13 +484,15 @@ def create_app(
         if not config.accepts_codex_model(request.model):
             return _error(422, "invalid_request", "The evaluation request is invalid.")
         snapshot = current_usage()
-        if snapshot is None:
+        if config.usage_mode == "subscription" and snapshot is None:
             return _error(503, "usage_unavailable", "Current Codex subscription usage is unavailable.")
         try:
             total_tasks = len(instance_ids_for_task_set(get_catalog().instance_ids, request.task_set))
         except CatalogError:
             return _error(503, "benchmark_unavailable", "The pinned benchmark task set is unavailable.")
-        blocked = snapshot.rate_limit_reached_type is not None or snapshot.used_percent >= request.usage_pause_percent
+        blocked = snapshot is not None and (
+            snapshot.rate_limit_reached_type is not None or snapshot.used_percent >= request.usage_pause_percent
+        )
         response = BatchPreviewResponse(
             powercontext_ref=request.powercontext_ref,
             benchmark="swebench-pro",
@@ -514,9 +518,11 @@ def create_app(
         if replay is not None:
             return JSONResponse(status_code=200, content=_batch_payload(replay), headers=_NO_STORE)
         snapshot = current_usage()
-        if snapshot is None:
+        if config.usage_mode == "subscription" and snapshot is None:
             return _error(503, "usage_unavailable", "Current Codex subscription usage is unavailable.")
-        if snapshot.rate_limit_reached_type is not None or snapshot.used_percent >= request.usage_pause_percent:
+        if snapshot is not None and (
+            snapshot.rate_limit_reached_type is not None or snapshot.used_percent >= request.usage_pause_percent
+        ):
             return _error(
                 409,
                 "usage_threshold_reached",
@@ -629,17 +635,23 @@ def create_app(
     def account_usage() -> Response:
         snapshot = current_usage()
         if snapshot is None:
-            return _error(503, "usage_unavailable", "Current Codex subscription usage is unavailable.")
+            code = "usage_not_applicable" if config.usage_mode == "api_key" else "usage_unavailable"
+            message = (
+                "Subscription usage does not apply to API-key authentication."
+                if config.usage_mode == "api_key"
+                else "Current Codex subscription usage is unavailable."
+            )
+            return _error(503, code, message)
         return JSONResponse(content=snapshot.model_dump(mode="json"), headers=_NO_STORE)
 
     @app.post("/api/batches/{batch_id}/tasks/{task_id}/retry")
     def retry_batch_task(batch_id: str, task_id: str, request: TaskRetryRequest) -> Response:
         snapshot = current_usage()
-        if snapshot is None:
+        if config.usage_mode == "subscription" and snapshot is None:
             return _error(503, "usage_unavailable", "Current Codex subscription usage is unavailable.")
         try:
             batch = task_store.get_batch(batch_id)
-            if (
+            if snapshot is not None and (
                 snapshot.rate_limit_reached_type is not None
                 or snapshot.used_percent >= batch.control.usage_pause_percent
             ):
@@ -764,7 +776,7 @@ def create_app(
                 tasks,
                 runs_root=config.run_root / "runs",
                 catalog=get_catalog(),
-                latest_usage=task_store.latest_usage_snapshot(),
+                latest_usage=(task_store.latest_usage_snapshot() if config.usage_mode == "subscription" else None),
             )
         except (CatalogError, ReportingError, OSError, ValueError):
             return _error(409, "report_unavailable", "The batch report is not available.")

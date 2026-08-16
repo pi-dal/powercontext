@@ -3121,6 +3121,21 @@ def test_auth_is_copied_minimally_with_mode_0600_and_homes_are_not_results(tmp_p
     assert not paths.pc_home.is_relative_to(paths.result_root)
 
 
+def test_optional_codex_config_is_copied_with_mode_0600(tmp_path: Path) -> None:
+    source = tmp_path / "outside-results/provider.toml"
+    source.parent.mkdir(parents=True)
+    source.write_text('model_provider = "relay"\n', encoding="utf-8")
+    source.chmod(0o600)
+    paths = replace(make_paths(tmp_path), codex_config_source=source)
+
+    destination = paths.copy_codex_config()
+
+    assert destination is not None
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    assert destination.read_bytes() == source.read_bytes()
+    assert destination == paths.codex_home / "config.toml"
+
+
 def test_fake_codex_fixture_is_executable_and_offline(tmp_path: Path) -> None:
     del tmp_path
     fake = Path(__file__).parent / "fixtures/fake_codex.py"
