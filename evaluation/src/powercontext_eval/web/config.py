@@ -50,6 +50,12 @@ class _EnvironmentNumbers(BaseModel):
         return value
 
 
+class _EnvironmentUsage(BaseModel):
+    """Validate the accounting mode while preserving Pydantic configuration errors."""
+
+    usage_mode: Literal["subscription", "api_key"] = "subscription"
+
+
 class WebConfig(BaseModel):
     """Validated process configuration with secret-bearing fields excluded from serialization."""
 
@@ -256,9 +262,7 @@ class WebConfig(BaseModel):
                 "workspace_reclaim_interval_seconds": environ.get(f"{prefix}WORKSPACE_RECLAIM_INTERVAL_SECONDS", "10"),
             }
         )
-        usage_mode = environ.get(f"{prefix}USAGE_MODE", "subscription")
-        if usage_mode not in {"subscription", "api_key"}:
-            raise ValueError("Usage mode must be subscription or api_key")
+        usage = _EnvironmentUsage.model_validate({"usage_mode": environ.get(f"{prefix}USAGE_MODE", "subscription")})
 
         return cls.for_root(
             root,
@@ -283,7 +287,7 @@ class WebConfig(BaseModel):
             lease_seconds=numbers.lease_seconds,
             poll_seconds=numbers.poll_seconds,
             usage_pause_percent=numbers.usage_pause_percent,
-            usage_mode=usage_mode,
+            usage_mode=usage.usage_mode,
             usage_probe_seconds=numbers.usage_probe_seconds,
             usage_probe_timeout_seconds=numbers.usage_probe_timeout_seconds,
             usage_snapshot_max_age_seconds=numbers.usage_snapshot_max_age_seconds,
